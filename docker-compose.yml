@@ -1,0 +1,37 @@
+# docker-compose.yml
+# Spins up two intentionally vulnerable apps for testing PentraAI.
+#
+# Usage:
+#   docker-compose up -d
+#
+# DVWA:       http://localhost:4280   (admin / password)
+# Juice Shop: http://localhost:3001
+#
+# ⚠️  These apps are intentionally insecure.
+#     Run them ONLY on your local machine, never expose to internet.
+
+version: "3.8"
+
+services:
+
+  # ── DVWA (Damn Vulnerable Web Application) ─────────────────────
+  # Classic intentionally vulnerable PHP app
+  # Used to test: IDOR, Broken Auth, SQL Injection, etc.
+  dvwa:
+    image: vulnerables/web-dvwa
+    container_name: pentraai_dvwa
+    ports:
+      - "4280:80"
+    environment:
+      - MYSQL_PASS=password
+    restart: unless-stopped
+
+  # ── OWASP Juice Shop ───────────────────────────────────────────
+  # Modern intentionally vulnerable Node.js app
+  # Used to test: IDOR, Business Logic, JWT, GraphQL, etc.
+  juiceshop:
+    image: bkimminich/juice-shop
+    container_name: pentraai_juiceshop
+    ports:
+      - "3001:3000"
+    restart: unless-stopped
