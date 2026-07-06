@@ -1,0 +1,618 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>PentraAI — Autonomous Security Testing</title>
+<style>
+    :root {
+        --bg:        #0a0e16;
+        --panel:     #121823;
+        --panel-2:   #1a2230;
+        --border:    #232d3f;
+        --text:      #e2e8f0;
+        --text-dim:  #7d8aa3;
+        --accent:    #00d9a3;
+        --accent-dim:#0a7a5e;
+        --critical:  #ff4d4d;
+        --high:      #ff8c3b;
+        --medium:    #ffc53b;
+        --low:       #4ade80;
+        --mono: 'SF Mono', 'Monaco', 'Cascadia Code', 'Courier New', monospace;
+    }
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+        font-family: var(--mono);
+        background: var(--bg);
+        color: var(--text);
+        line-height: 1.6;
+        min-height: 100vh;
+    }
+
+    /* Header */
+    .topbar {
+        border-bottom: 1px solid var(--border);
+        padding: 16px 24px;
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        background: var(--panel);
+    }
+    .logo-mark {
+        width: 28px; height: 28px;
+        border: 2px solid var(--accent);
+        border-radius: 6px;
+        display: flex; align-items: center; justify-content: center;
+        color: var(--accent);
+        font-weight: bold;
+        font-size: 14px;
+    }
+    .topbar h1 { font-size: 16px; font-weight: 600; letter-spacing: 0.5px; }
+    .topbar .tag {
+        font-size: 11px; color: var(--text-dim);
+        border: 1px solid var(--border); padding: 2px 8px;
+        border-radius: 4px; margin-left: auto;
+    }
+
+    .wrap { max-width: 1000px; margin: 0 auto; padding: 32px 24px; }
+
+    /* Scan input panel */
+    .scan-panel {
+        background: var(--panel);
+        border: 1px solid var(--border);
+        border-radius: 12px;
+        padding: 28px;
+        margin-bottom: 24px;
+    }
+    .scan-panel .label {
+        font-size: 12px; color: var(--text-dim);
+        text-transform: uppercase; letter-spacing: 1px;
+        margin-bottom: 10px;
+    }
+    .url-row { display: flex; gap: 12px; }
+    .url-input {
+        flex: 1;
+        background: var(--bg);
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        padding: 14px 16px;
+        color: var(--text);
+        font-family: var(--mono);
+        font-size: 15px;
+        outline: none;
+        transition: border-color 0.2s;
+    }
+    .url-input:focus { border-color: var(--accent); }
+    .url-input::placeholder { color: var(--text-dim); }
+
+    .scan-btn {
+        background: var(--accent);
+        color: var(--bg);
+        border: none;
+        border-radius: 8px;
+        padding: 14px 32px;
+        font-family: var(--mono);
+        font-size: 15px;
+        font-weight: 700;
+        cursor: pointer;
+        transition: all 0.2s;
+        white-space: nowrap;
+    }
+    .scan-btn:hover:not(:disabled) { background: #00f0b5; transform: translateY(-1px); }
+    .scan-btn:disabled { background: var(--accent-dim); cursor: not-allowed; opacity: 0.6; }
+
+    /* Module toggles */
+    .modules-row {
+        display: flex; gap: 10px; margin-top: 18px; flex-wrap: wrap;
+    }
+    .module-chip {
+        display: flex; align-items: center; gap: 8px;
+        background: var(--panel-2);
+        border: 1px solid var(--border);
+        border-radius: 6px;
+        padding: 8px 14px;
+        font-size: 13px;
+        cursor: pointer;
+        user-select: none;
+        transition: all 0.15s;
+    }
+    .module-chip.active {
+        border-color: var(--accent);
+        color: var(--accent);
+    }
+    .module-chip .dot {
+        width: 8px; height: 8px; border-radius: 50%;
+        background: var(--border);
+    }
+    .module-chip.active .dot { background: var(--accent); }
+
+    /* Advanced creds (collapsible) */
+    .adv-toggle {
+        margin-top: 16px; font-size: 12px; color: var(--text-dim);
+        cursor: pointer; user-select: none;
+    }
+    .adv-toggle:hover { color: var(--accent); }
+    .adv-panel {
+        display: none; margin-top: 16px; gap: 12px;
+        grid-template-columns: 1fr 1fr;
+    }
+    .adv-panel.open { display: grid; }
+    .adv-panel input {
+        background: var(--bg); border: 1px solid var(--border);
+        border-radius: 6px; padding: 10px 12px; color: var(--text);
+        font-family: var(--mono); font-size: 13px; outline: none;
+    }
+    .adv-panel input:focus { border-color: var(--accent); }
+    .adv-hint {
+        grid-column: 1 / -1; font-size: 11px; color: var(--text-dim);
+    }
+
+    /* Progress stream */
+    .stream-panel {
+        background: var(--panel);
+        border: 1px solid var(--border);
+        border-radius: 12px;
+        margin-bottom: 24px;
+        overflow: hidden;
+        display: none;
+    }
+    .stream-panel.visible { display: block; }
+    .stream-header {
+        padding: 14px 20px;
+        border-bottom: 1px solid var(--border);
+        display: flex; align-items: center; gap: 10px;
+        font-size: 13px;
+        background: var(--panel-2);
+    }
+    .pulse {
+        width: 10px; height: 10px; border-radius: 50%;
+        background: var(--accent);
+        animation: pulse 1.5s infinite;
+    }
+    @keyframes pulse {
+        0%, 100% { opacity: 1; box-shadow: 0 0 0 0 rgba(0,217,163,0.4); }
+        50% { opacity: 0.6; box-shadow: 0 0 0 6px rgba(0,217,163,0); }
+    }
+    .stream-body {
+        padding: 16px 20px;
+        max-height: 280px;
+        overflow-y: auto;
+        font-size: 13px;
+    }
+    .log-line {
+        padding: 3px 0;
+        color: var(--text-dim);
+        display: flex; gap: 10px;
+    }
+    .log-line .phase {
+        color: var(--accent);
+        min-width: 90px;
+        text-transform: uppercase;
+        font-size: 11px;
+    }
+    .log-line.finding-line { color: var(--text); }
+
+    /* Live counters */
+    .counters {
+        display: flex; gap: 12px; margin-bottom: 24px;
+        display: none;
+    }
+    .counters.visible { display: flex; }
+    .counter {
+        flex: 1;
+        background: var(--panel);
+        border: 1px solid var(--border);
+        border-radius: 10px;
+        padding: 18px;
+        text-align: center;
+    }
+    .counter .num { font-size: 28px; font-weight: 700; }
+    .counter .lbl {
+        font-size: 11px; color: var(--text-dim);
+        text-transform: uppercase; letter-spacing: 1px; margin-top: 4px;
+    }
+    .counter.critical .num { color: var(--critical); }
+    .counter.high .num { color: var(--high); }
+    .counter.medium .num { color: var(--medium); }
+    .counter.total .num { color: var(--accent); }
+
+    /* Findings list */
+    .findings { display: none; }
+    .findings.visible { display: block; }
+    .finding-card {
+        background: var(--panel);
+        border: 1px solid var(--border);
+        border-left: 4px solid var(--text-dim);
+        border-radius: 10px;
+        margin-bottom: 16px;
+        overflow: hidden;
+        animation: slideIn 0.3s ease;
+    }
+    @keyframes slideIn {
+        from { opacity: 0; transform: translateY(8px); }
+        to { opacity: 1; transform: translateY(0); }
+    }
+    .finding-card.critical { border-left-color: var(--critical); }
+    .finding-card.high { border-left-color: var(--high); }
+    .finding-card.medium { border-left-color: var(--medium); }
+    .finding-card.low { border-left-color: var(--low); }
+
+    .fc-head {
+        padding: 16px 20px;
+        cursor: pointer;
+        display: flex; align-items: center; gap: 12px;
+    }
+    .fc-head .sev {
+        font-size: 10px; font-weight: 700; padding: 3px 10px;
+        border-radius: 4px; text-transform: uppercase; letter-spacing: 0.5px;
+        white-space: nowrap;
+    }
+    .sev.critical { background: var(--critical); color: #fff; }
+    .sev.high { background: var(--high); color: #fff; }
+    .sev.medium { background: var(--medium); color: #000; }
+    .sev.low { background: var(--low); color: #000; }
+    .fc-head .name { font-size: 14px; flex: 1; }
+    .fc-head .chevron { color: var(--text-dim); transition: transform 0.2s; }
+    .finding-card.open .chevron { transform: rotate(90deg); }
+
+    .fc-body {
+        display: none;
+        padding: 0 20px 20px;
+        border-top: 1px solid var(--border);
+    }
+    .finding-card.open .fc-body { display: block; }
+    .fc-section { margin-top: 16px; }
+    .fc-section .lbl {
+        font-size: 11px; color: var(--text-dim); text-transform: uppercase;
+        letter-spacing: 0.5px; margin-bottom: 6px;
+    }
+    .fc-section .endpoint { font-size: 13px; color: var(--accent); word-break: break-all; }
+    .code {
+        background: var(--bg); border: 1px solid var(--border);
+        border-radius: 6px; padding: 12px; font-size: 12px;
+        overflow-x: auto; white-space: pre-wrap; word-break: break-word;
+        color: var(--text-dim);
+    }
+
+    /* Action bar */
+    .action-bar {
+        display: none; gap: 12px; margin-bottom: 24px;
+    }
+    .action-bar.visible { display: flex; }
+    .report-btn {
+        background: var(--panel-2);
+        border: 1px solid var(--accent);
+        color: var(--accent);
+        border-radius: 8px;
+        padding: 12px 24px;
+        font-family: var(--mono);
+        font-size: 14px;
+        font-weight: 600;
+        cursor: pointer;
+        text-decoration: none;
+        display: inline-flex; align-items: center; gap: 8px;
+        transition: all 0.2s;
+    }
+    .report-btn:hover { background: var(--accent); color: var(--bg); }
+
+    /* Empty state */
+    .empty {
+        text-align: center; padding: 60px 20px; color: var(--text-dim);
+        display: none;
+    }
+    .empty.visible { display: block; }
+
+    .scrollbar::-webkit-scrollbar { width: 8px; }
+    .scrollbar::-webkit-scrollbar-track { background: var(--bg); }
+    .scrollbar::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
+</style>
+</head>
+<body>
+    <div class="topbar">
+        <div class="logo-mark">P</div>
+        <h1>PentraAI</h1>
+        <span class="tag">Autonomous Security Testing</span>
+    </div>
+
+    <div class="wrap">
+        <!-- Scan input -->
+        <div class="scan-panel">
+            <div class="label">Target URL</div>
+            <div class="url-row">
+                <input
+                    type="text"
+                    id="targetUrl"
+                    class="url-input"
+                    placeholder="http://localhost:3001"
+                    value="http://localhost:3001"
+                >
+                <button class="scan-btn" id="scanBtn" onclick="startScan()">Start Scan</button>
+            </div>
+
+            <div class="modules-row" id="modules">
+                <div class="module-chip active" data-module="idor" onclick="toggleModule(this)">
+                    <span class="dot"></span> IDOR / BOLA
+                </div>
+                <div class="module-chip active" data-module="broken_auth" onclick="toggleModule(this)">
+                    <span class="dot"></span> Broken Auth
+                </div>
+                <div class="module-chip active" data-module="race_condition" onclick="toggleModule(this)">
+                    <span class="dot"></span> Race Condition
+                </div>
+                <div class="module-chip active" data-module="ssrf" onclick="toggleModule(this)">
+                    <span class="dot"></span> SSRF
+                </div>
+                <div class="module-chip active" data-module="bfla" onclick="toggleModule(this)">
+                    <span class="dot"></span> BFLA
+                </div>
+            </div>
+
+            <div class="adv-toggle" onclick="toggleAdvanced()">▸ Advanced: provide credentials (optional)</div>
+            <div class="adv-panel" id="advPanel">
+                <input type="text" id="userAEmail" placeholder="User A email (optional)">
+                <input type="text" id="userAPass" placeholder="User A password (optional)">
+                <input type="text" id="userBEmail" placeholder="User B email (optional)">
+                <input type="text" id="userBPass" placeholder="User B password (optional)">
+                <div class="adv-hint">Leave blank to let PentraAI create test accounts automatically. Provide credentials only for apps that require manual registration.</div>
+            </div>
+        </div>
+
+        <!-- Live stream -->
+        <div class="stream-panel" id="streamPanel">
+            <div class="stream-header">
+                <span class="pulse" id="pulse"></span>
+                <span id="streamStatus">Initialising scan...</span>
+            </div>
+            <div class="stream-body scrollbar" id="streamBody"></div>
+        </div>
+
+        <!-- Counters -->
+        <div class="counters" id="counters">
+            <div class="counter total"><div class="num" id="cTotal">0</div><div class="lbl">Findings</div></div>
+            <div class="counter critical"><div class="num" id="cCritical">0</div><div class="lbl">Critical</div></div>
+            <div class="counter high"><div class="num" id="cHigh">0</div><div class="lbl">High</div></div>
+            <div class="counter medium"><div class="num" id="cMedium">0</div><div class="lbl">Medium</div></div>
+        </div>
+
+        <!-- Action bar -->
+        <div class="action-bar" id="actionBar">
+            <a class="report-btn" id="reportBtn" target="_blank">View Full Report →</a>
+            <a class="report-btn" id="pdfBtn" target="_blank">⬇ Download PDF</a>
+        </div>
+
+        <!-- Findings -->
+        <div class="findings" id="findings"></div>
+
+        <!-- Empty -->
+        <div class="empty" id="empty">
+            <p>Scan complete. No vulnerabilities detected in the tested categories.</p>
+        </div>
+    </div>
+
+<script>
+    const API = "http://localhost:8000";
+    let currentScanId = null;
+
+    function toggleModule(el) {
+        el.classList.toggle("active");
+    }
+
+    function toggleAdvanced() {
+        document.getElementById("advPanel").classList.toggle("open");
+    }
+
+    function getSelectedModules() {
+        const chips = document.querySelectorAll(".module-chip.active");
+        return Array.from(chips).map(c => c.dataset.module);
+    }
+
+    function severityClass(sev) {
+        return (sev || "info").toLowerCase();
+    }
+
+    async function startScan() {
+        const url = document.getElementById("targetUrl").value.trim();
+        if (!url) { alert("Please enter a target URL"); return; }
+
+        const modules = getSelectedModules();
+        if (modules.length === 0) { alert("Select at least one module"); return; }
+
+        // Reset UI
+        const btn = document.getElementById("scanBtn");
+        btn.disabled = true;
+        btn.textContent = "Scanning...";
+        document.getElementById("streamBody").innerHTML = "";
+        document.getElementById("findings").innerHTML = "";
+        document.getElementById("findings").classList.remove("visible");
+        document.getElementById("empty").classList.remove("visible");
+        document.getElementById("actionBar").classList.remove("visible");
+        document.getElementById("streamPanel").classList.add("visible");
+        document.getElementById("counters").classList.add("visible");
+        document.getElementById("pulse").style.display = "block";
+        document.getElementById("streamStatus").textContent = "Scanning " + url;
+
+        let counts = { total: 0, critical: 0, high: 0, medium: 0 };
+
+        // Build request
+        const body = {
+            target_url:      url,
+            user_a_email:    document.getElementById("userAEmail").value.trim(),
+            user_a_password: document.getElementById("userAPass").value.trim(),
+            user_b_email:    document.getElementById("userBEmail").value.trim(),
+            user_b_password: document.getElementById("userBPass").value.trim(),
+            modules:         modules
+        };
+
+        try {
+            // Start scan
+            const res = await fetch(API + "/scan", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify(body)
+            });
+            const data = await res.json();
+            currentScanId = data.scan_id;
+
+            // Connect to stream
+            const streamUrl = API + "/scan/" + currentScanId + "/stream";
+            const evtSource = new EventSource(streamUrl);
+
+            evtSource.onmessage = function(event) {
+                const msg = JSON.parse(event.data);
+                handleEvent(msg, counts);
+
+                if (msg.type === "done") {
+                    evtSource.close();
+                    finishScan(counts);
+                }
+            };
+
+            evtSource.onerror = function() {
+                evtSource.close();
+                finishScan(counts);
+            };
+
+        } catch (err) {
+            addLog("error", "Failed to connect to PentraAI server at " + API);
+            addLog("error", "Make sure the server is running: python -m uvicorn main:app --port 8000");
+            resetButton();
+        }
+    }
+
+    function handleEvent(msg, counts) {
+        if (msg.type === "progress") {
+            addLog(msg.phase || "info", msg.message);
+            if (msg.phase) {
+                document.getElementById("streamStatus").textContent = msg.message;
+            }
+        }
+        else if (msg.type === "finding") {
+            // Skip "setup failed" info findings in the counter
+            const sev = (msg.severity || "info").toLowerCase();
+            if (sev !== "info") {
+                counts.total++;
+                if (counts[sev] !== undefined) counts[sev]++;
+                updateCounters(counts);
+            }
+            addLog("finding", "Found: " + msg.vulnerability + " [" + sev + "]", true);
+            renderFinding(msg);
+        }
+        else if (msg.type === "complete") {
+            addLog("complete", msg.message);
+        }
+        else if (msg.type === "error") {
+            addLog("error", msg.message);
+        }
+    }
+
+    function addLog(phase, message, isFinding) {
+        const body = document.getElementById("streamBody");
+        const line = document.createElement("div");
+        line.className = "log-line" + (isFinding ? " finding-line" : "");
+        line.innerHTML = '<span class="phase">' + phase + '</span><span>' + escapeHtml(message) + '</span>';
+        body.appendChild(line);
+        body.scrollTop = body.scrollHeight;
+    }
+
+    function updateCounters(counts) {
+        document.getElementById("cTotal").textContent = counts.total;
+        document.getElementById("cCritical").textContent = counts.critical;
+        document.getElementById("cHigh").textContent = counts.high;
+        document.getElementById("cMedium").textContent = counts.medium;
+    }
+
+    function renderFinding(f) {
+        const sev = severityClass(f.severity);
+        if (sev === "info") return;  // don't render setup-failed cards
+
+        const findings = document.getElementById("findings");
+        findings.classList.add("visible");
+
+        const card = document.createElement("div");
+        card.className = "finding-card " + sev;
+
+        const evidence = f.evidence || {};
+        let evidenceHtml = "";
+
+        // Request
+        if (evidence.request) {
+            const req = evidence.request;
+            let reqText = (req.method || "GET") + " " + (req.url || "");
+            if (req.headers) {
+                for (const [k, v] of Object.entries(req.headers)) {
+                    reqText += "\n" + k + ": " + v;
+                }
+            }
+            evidenceHtml += '<div class="fc-section"><div class="lbl">Request</div><div class="code">' + escapeHtml(reqText) + '</div></div>';
+        }
+
+        // Response
+        if (evidence.response) {
+            let respText = "HTTP " + (evidence.response.status || "") + "\n\n" + (evidence.response.body || "");
+            evidenceHtml += '<div class="fc-section"><div class="lbl">Response</div><div class="code">' + escapeHtml(respText.substring(0, 500)) + '</div></div>';
+        }
+
+        // Race condition stats
+        if (evidence.requests_sent) {
+            evidenceHtml += '<div class="fc-section"><div class="lbl">Evidence</div><div class="code">' +
+                'Requests sent: ' + evidence.requests_sent + '\n' +
+                'Succeeded: ' + (evidence.successful_responses || 0) + '\n' +
+                'Expected max: ' + (evidence.expected_max_successes || 1) + '\n\n' +
+                'Baseline response (HTTP ' + (evidence.probe_status || '') + '):\n' +
+                escapeHtml(String(evidence.probe_response || "").substring(0, 200)) +
+                '</div></div>';
+        }
+
+        // AI reasoning
+        if (f.ai_reasoning) {
+            evidenceHtml += '<div class="fc-section"><div class="lbl">Analysis</div><div style="font-size:13px;color:var(--text-dim)">' + escapeHtml(f.ai_reasoning) + '</div></div>';
+        }
+
+        card.innerHTML =
+            '<div class="fc-head" onclick="this.parentElement.classList.toggle(\'open\')">' +
+                '<span class="sev ' + sev + '">' + sev + '</span>' +
+                '<span class="name">' + escapeHtml(f.vulnerability) + '</span>' +
+                '<span class="chevron">▸</span>' +
+            '</div>' +
+            '<div class="fc-body">' +
+                '<div class="fc-section"><div class="lbl">Endpoint</div><div class="endpoint">' + escapeHtml(f.endpoint || "") + '</div></div>' +
+                (f.owasp ? '<div class="fc-section"><div class="lbl">OWASP</div><div style="font-size:13px;color:var(--text-dim)">' + escapeHtml(f.owasp) + '</div></div>' : '') +
+                evidenceHtml +
+            '</div>';
+
+        findings.appendChild(card);
+    }
+
+    function finishScan(counts) {
+        document.getElementById("pulse").style.display = "none";
+        document.getElementById("streamStatus").textContent = "Scan complete — " + counts.total + " finding(s)";
+        resetButton();
+
+        // Show report button
+        if (currentScanId) {
+            const reportBtn = document.getElementById("reportBtn");
+            reportBtn.href = API + "/scan/" + currentScanId + "/report";
+            document.getElementById("pdfBtn").href = API + "/scan/" + currentScanId + "/report.pdf";
+            document.getElementById("actionBar").classList.add("visible");
+        }
+
+        // Empty state if no findings
+        if (counts.total === 0) {
+            document.getElementById("empty").classList.add("visible");
+        }
+    }
+
+    function resetButton() {
+        const btn = document.getElementById("scanBtn");
+        btn.disabled = false;
+        btn.textContent = "Start Scan";
+    }
+
+    function escapeHtml(text) {
+        const div = document.createElement("div");
+        div.textContent = String(text);
+        return div.innerHTML;
+    }
+</script>
+</body>
+</html>
