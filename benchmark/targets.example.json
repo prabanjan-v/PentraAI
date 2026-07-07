@@ -1,0 +1,27 @@
+{
+  "api_base": "http://localhost:8000",
+
+  "targets": {
+    "juiceshop": {
+      "target_url": "http://localhost:3001",
+      "modules": ["idor", "broken_auth", "ssrf", "bfla", "race_condition"],
+      "user_a_email": "",
+      "user_a_password": "",
+      "user_b_email": "",
+      "user_b_password": "",
+      "user_a_token": "",
+      "user_b_token": ""
+    },
+
+    "crapi": {
+      "target_url": "http://localhost:8888",
+      "modules": ["idor", "broken_auth", "ssrf", "bfla", "race_condition"],
+      "user_a_email": "",
+      "user_a_password": "",
+      "user_b_email": "",
+      "user_b_password": "",
+      "user_a_token": "",
+      "user_b_token": ""
+    }
+  }
+}

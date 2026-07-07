@@ -1,0 +1,27 @@
+{
+  "_comment": "In-scope known vulnerabilities per target, limited to the vuln classes PentraAI's modules actually test (idor/bola, broken_auth/jwt, ssrf, bfla, race_condition). This is the DENOMINATOR for detection rate. Do NOT include out-of-scope classes (SQLi, XSS, etc.) here — PentraAI is not designed to find them, so counting them would unfairly deflate the score. Sources: OWASP crAPI challenges page, OWASP Juice Shop companion guide.",
+
+  "crapi": {
+    "display_name": "OWASP crAPI",
+    "in_scope_vulns": [
+      { "id": "crapi-idor-1", "module": "idor",        "title": "BOLA: access another user's vehicle location", "endpoint_hint": "/identity/api/v2/vehicle/{vehicleId}/location", "notes": "Vehicle IDs are GUIDs harvested from the Community page." },
+      { "id": "crapi-idor-2", "module": "idor",        "title": "BOLA: access another user's mechanic reports",  "endpoint_hint": "/workshop/api/mechanic/mechanic_report", "notes": "report_id is enumerable/predictable." },
+      { "id": "crapi-auth-1", "module": "broken_auth", "title": "JWT forgery (alg=none / weak secret / alg confusion)", "endpoint_hint": "Authorization: Bearer <jwt>", "notes": "crAPI accepts forged JWTs for full access." },
+      { "id": "crapi-ssrf-1", "module": "ssrf",        "title": "SSRF via contact-mechanic form",                 "endpoint_hint": "/workshop/api/merchant/contact_mechanic", "notes": "mechanic_api URL is attacker-controllable." },
+      { "id": "crapi-bfla-1", "module": "bfla",        "title": "BFLA: delete another user's video via admin endpoint", "endpoint_hint": "DELETE /identity/api/v2/admin/videos/{id}", "notes": "Function-level auth not enforced." },
+      { "id": "crapi-race-1", "module": "race_condition", "title": "Race: redeem an already-claimed coupon (candidate)", "endpoint_hint": "/community/api/v2/coupon/validate-coupon", "notes": "OPTIONAL/CANDIDATE — verify this is actually race-exploitable in your build before counting it." }
+    ]
+  },
+
+  "juiceshop": {
+    "display_name": "OWASP Juice Shop",
+    "in_scope_vulns": [
+      { "id": "js-idor-1", "module": "idor",        "title": "IDOR: view another user's basket",          "endpoint_hint": "GET /rest/basket/{id}", "notes": "Returns basket by numeric id with no ownership check." },
+      { "id": "js-idor-2", "module": "idor",        "title": "IDOR: add item to another user's basket",   "endpoint_hint": "POST /api/BasketItems (BasketId)", "notes": "BasketId trusted from client." },
+      { "id": "js-idor-3", "module": "idor",        "title": "IDOR: forged feedback via client UserId",   "endpoint_hint": "POST /api/Feedbacks (UserId)", "notes": "UserId trusted from client — may be outside current module coverage." },
+      { "id": "js-auth-1", "module": "broken_auth", "title": "JWT: unsigned / alg=none token accepted",   "endpoint_hint": "Authorization: Bearer <jwt>", "notes": "Forge admin via null-signature token." },
+      { "id": "js-auth-2", "module": "broken_auth", "title": "JWT: forge RSA-signed token (Tier 2 / alg confusion)", "endpoint_hint": "Authorization: Bearer <jwt>", "notes": "Weak RSA key handling." },
+      { "id": "js-ssrf-1", "module": "ssrf",        "title": "SSRF: request a hidden internal resource",  "endpoint_hint": "profile image URL / order tracking", "notes": "Server fetches attacker-supplied URL." }
+    ]
+  }
+}
