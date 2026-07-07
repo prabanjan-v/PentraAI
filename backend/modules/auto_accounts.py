@@ -13,10 +13,26 @@ telling the user exactly what went wrong.
 
 import json
 import uuid
+import asyncio
 import httpx
 from bs4 import BeautifulSoup
 from llm import call_llm
 from config import settings
+
+
+# ── Per-scan account cache ────────────────────────────────────────
+# Every module (idor, broken_auth, bfla, ssrf, race) used to register and log in
+# its own fresh accounts, so one scan ran the whole register→login dance ~5 times
+# — 5× the chances for an intermittent failure ("Setup Failed"). We now create the
+# accounts once per target and reuse them for the rest of the scan. main.py calls
+# reset_account_cache() at the start of every scan so each scan still gets fresh
+# accounts.
+_ACCOUNT_CACHE: dict = {}
+
+
+def reset_account_cache() -> None:
+    """Clear cached accounts. Called by main.py at the start of each scan."""
+    _ACCOUNT_CACHE.clear()
 
 
 TEST_PASSWORD = "PentraAI_Test@123"
@@ -31,15 +47,42 @@ def _make_email(suffix: str) -> str:
 
 async def _detect_app(client: httpx.AsyncClient, base_url: str) -> str:
     """Detect which known app we are targeting."""
-    try:
-        r = await client.get(base_url)
-        body = r.text.lower()
-        if "juice" in body or "owasp juice" in body:
-            return "juiceshop"
-        if "dvwa" in body or "damn vulnerable" in body:
-            return "dvwa"
-    except Exception:
-        pass
+    # Retry a few times: under load the homepage GET can fail or return an
+    # incomplete body, which used to drop us into the unreliable generic flow
+    # (the "No login endpoint responded with a token" error).
+    for attempt in range(3):
+        try:
+            r = await client.get(base_url)
+            body = r.text.lower()
+            if "juice" in body or "owasp juice" in body:
+                return "juiceshop"
+            if "dvwa" in body or "damn vulnerable" in body:
+                return "dvwa"
+            if "crapi" in body or "completely ridiculous" in body:
+                return "crapi"
+        except Exception:
+            pass
+
+        # crAPI's frontend may not have the name on the homepage —
+        # probe its signature API endpoint to detect it
+        try:
+            r = await client.get(base_url + "/identity/api/auth/signup")
+            # crAPI returns 405 Method Not Allowed for GET on signup (POST only)
+            if r.status_code in [405, 400, 401]:
+                return "crapi"
+        except Exception:
+            pass
+
+        # Juice Shop signature probe as a fallback (its REST login endpoint exists)
+        try:
+            r = await client.get(base_url + "/rest/admin/application-version")
+            if r.status_code == 200:
+                return "juiceshop"
+        except Exception:
+            pass
+
+        await asyncio.sleep(0.5 * (attempt + 1))
+
     return "generic"
 
 
@@ -80,7 +123,69 @@ async def create_two_accounts(target_url: str, recon_data: dict) -> dict:
     """
     Fully autonomous account creation.
     Returns success dict with both tokens, or failure with help message.
+
+    If recon_data contains provided_token_a and provided_token_b
+    (injected by main.py when user provides tokens directly),
+    skip auto-registration and use those tokens directly.
+    This supports apps with email verification like crAPI.
     """
+    # ── Use provided tokens if available ─────────────────────────
+    token_a = recon_data.get("provided_token_a", "")
+    token_b = recon_data.get("provided_token_b", "")
+    email_a = recon_data.get("provided_email_a", "user_a@pentraai.com")
+    email_b = recon_data.get("provided_email_b", "user_b@pentraai.com")
+
+    if token_a and token_b:
+        print(f"AUTO-ACCOUNTS: Using provided tokens for {email_a} and {email_b}")
+        return {
+            "success":      True,
+            "token_a":      token_a,
+            "user_a_email": email_a,
+            "user_a_id":    "",
+            "token_b":      token_b,
+            "user_b_email": email_b,
+            "user_b_id":    "",
+            "error":        None,
+            "needs_help":   False,
+            "help_message": None,
+        }
+
+    # ── Use provided credentials to login (fresh tokens each scan) ─
+    # If user gave emails+passwords (not tokens), login to get fresh tokens.
+    # This avoids token expiry — works for crAPI and generic JSON APIs.
+    cred_email_a = recon_data.get("cred_email_a", "")
+    cred_pass_a  = recon_data.get("cred_pass_a", "")
+    cred_email_b = recon_data.get("cred_email_b", "")
+    cred_pass_b  = recon_data.get("cred_pass_b", "")
+
+    if cred_email_a and cred_pass_a and cred_email_b and cred_pass_b:
+        print(f"AUTO-ACCOUNTS: Logging in with provided credentials (fresh tokens)...")
+        tok_a, uid_a = await login_one_account(target_url, cred_email_a, cred_pass_a)
+        tok_b, uid_b = await login_one_account(target_url, cred_email_b, cred_pass_b)
+        if tok_a and tok_b:
+            print(f"AUTO-ACCOUNTS: Both logins successful — got fresh tokens")
+            return {
+                "success":      True,
+                "token_a":      tok_a,
+                "user_a_email": cred_email_a,
+                "user_a_id":    uid_a,
+                "token_b":      tok_b,
+                "user_b_email": cred_email_b,
+                "user_b_id":    uid_b,
+                "error":        None,
+                "needs_help":   False,
+                "help_message": None,
+            }
+        print(f"AUTO-ACCOUNTS: Credential login failed (A={bool(tok_a)}, B={bool(tok_b)})")
+
+    # ── Reuse accounts already created earlier in THIS scan ───────
+    _cache_key = target_url.rstrip("/")
+    _cached = _ACCOUNT_CACHE.get(_cache_key)
+    if _cached and _cached.get("success"):
+        print("AUTO-ACCOUNTS: reusing shared accounts created earlier this scan")
+        return _cached
+
+    # ── Auto-registration flow ────────────────────────────────────
     async with httpx.AsyncClient(
         timeout=settings.request_timeout,
         follow_redirects=True,
@@ -90,9 +195,17 @@ async def create_two_accounts(target_url: str, recon_data: dict) -> dict:
         print(f"AUTO-ACCOUNTS: Detected app → {app_type}")
 
         if app_type == "juiceshop":
-            return await _juiceshop_flow(client, target_url)
+            result = await _juiceshop_flow(client, target_url)
+        elif app_type == "crapi":
+            result = await _crapi_flow(client, target_url)
         else:
-            return await _generic_flow(client, target_url, recon_data)
+            result = await _generic_flow(client, target_url, recon_data)
+
+    # Cache only successful setups so a transient failure doesn't poison the
+    # cache — the next module will simply try again from scratch.
+    if isinstance(result, dict) and result.get("success"):
+        _ACCOUNT_CACHE[_cache_key] = result
+    return result
 
 
 # ── Juice Shop flow ───────────────────────────────────────────────
@@ -124,7 +237,15 @@ async def _juiceshop_flow(client: httpx.AsyncClient, base_url: str) -> dict:
     for label, email in [("a", email_a), ("b", email_b)]:
         print(f"AUTO-ACCOUNTS: Logging in User {label.upper()} ({email})...")
         body = _generic_login_body(email, TEST_PASSWORD)
-        r_ok, r_body, err = await _post_get_response(client, login_url, body)
+        # Retry: the login can transiently fail right after registration.
+        r_ok, r_body, err, token = False, {}, "", None
+        for attempt in range(3):
+            r_ok, r_body, err = await _post_get_response(client, login_url, body)
+            if r_ok:
+                token = _dig(r_body, ["authentication", "token"])
+                if token:
+                    break
+            await asyncio.sleep(0.6 * (attempt + 1))
         if not r_ok:
             return _needs_help(
                 error=f"Juice Shop login failed: {err}",
@@ -134,7 +255,6 @@ async def _juiceshop_flow(client: httpx.AsyncClient, base_url: str) -> dict:
                     f"Emails: {email_a}, {email_b}. Password: {TEST_PASSWORD}"
                 )
             )
-        token   = _dig(r_body, ["authentication", "token"])
         user_id = _dig(r_body, ["authentication", "bid"])
         if not token:
             return _needs_help(
@@ -147,6 +267,99 @@ async def _juiceshop_flow(client: httpx.AsyncClient, base_url: str) -> dict:
         results[label] = {"token": token, "user_id": str(user_id or ""), "email": email}
 
     print("AUTO-ACCOUNTS: Both accounts ready ✓")
+    return {
+        "success":      True,
+        "token_a":      results["a"]["token"],
+        "user_a_email": results["a"]["email"],
+        "user_a_id":    results["a"]["user_id"],
+        "token_b":      results["b"]["token"],
+        "user_b_email": results["b"]["email"],
+        "user_b_id":    results["b"]["user_id"],
+        "error":        None,
+        "needs_help":   False,
+        "help_message": None,
+    }
+
+
+# ── crAPI flow ────────────────────────────────────────────────────
+
+def _make_crapi_phone() -> str:
+    """Generate a random 10-digit phone number not starting with 0."""
+    import random
+    first = str(random.randint(1, 9))            # 1-9, never 0
+    rest  = "".join(str(random.randint(0, 9)) for _ in range(9))
+    return first + rest
+
+
+async def _crapi_flow(client: httpx.AsyncClient, base_url: str) -> dict:
+    """
+    Fully automated crAPI account creation.
+
+    crAPI registration (no email verification needed):
+      POST /identity/api/auth/signup
+      Body: {name, email, number, password}
+
+    crAPI login:
+      POST /identity/api/auth/login
+      Body: {email, password}
+      Returns: {token: "eyJ..."}
+
+    Creates two fresh accounts each scan → both get full credit,
+    so stateful vulnerabilities (race conditions) are reproducible.
+    """
+    signup_url = base_url + "/identity/api/auth/signup"
+    login_url  = base_url + "/identity/api/auth/login"
+
+    # Generate unique emails for fresh accounts each scan
+    import time, random
+    stamp   = f"{int(time.time())}{random.randint(100, 999)}"
+    email_a = f"pentraai_a_{stamp}@test.com"
+    email_b = f"pentraai_b_{stamp}@test.com"
+    password = "PentraAI@123"
+
+    results = {}
+    for label, email in [("a", email_a), ("b", email_b)]:
+        # Step 1 — Register
+        print(f"AUTO-ACCOUNTS: Registering crAPI User {label.upper()} ({email})...")
+        signup_body = {
+            "name":     f"PentraAI User {label.upper()}",
+            "email":    email,
+            "number":   _make_crapi_phone(),
+            "password": password,
+        }
+        try:
+            r = await client.post(signup_url, json=signup_body)
+            print(f"AUTO-ACCOUNTS: Signup {label.upper()} → HTTP {r.status_code}")
+            if r.status_code not in [200, 201]:
+                # Account may already exist — try logging in anyway
+                print(f"AUTO-ACCOUNTS: Signup returned {r.status_code}: {r.text[:100]}")
+        except Exception as e:
+            return _needs_help(
+                error=f"crAPI signup failed for User {label.upper()}: {e}",
+                help_message=f"Could not register crAPI account. Reason: {e}"
+            )
+
+        # Step 2 — Login to get token
+        print(f"AUTO-ACCOUNTS: Logging in crAPI User {label.upper()}...")
+        try:
+            r = await client.post(login_url, json={"email": email, "password": password})
+            if r.status_code == 200:
+                token = r.json().get("token", "")
+                if token:
+                    results[label] = {"token": token, "user_id": "", "email": email}
+                    print(f"AUTO-ACCOUNTS: User {label.upper()} login success ✓")
+                    continue
+            return _needs_help(
+                error=f"crAPI login failed for User {label.upper()}: HTTP {r.status_code}",
+                help_message=f"Registered but login failed. Reason: {r.text[:150]}"
+            )
+        except Exception as e:
+            return _needs_help(
+                error=f"crAPI login error for User {label.upper()}: {e}",
+                help_message=f"Login request failed. Reason: {e}"
+            )
+
+    print("AUTO-ACCOUNTS: Both crAPI accounts ready ✓")
     return {
         "success":      True,
         "token_a":      results["a"]["token"],
@@ -469,6 +682,7 @@ async def login_one_account(
     """
     Log in with one set of credentials and return (token, user_id).
     Used by broken_auth.py to get a JWT to analyse.
+    Supports Juice Shop, crAPI, and generic JSON login APIs.
     """
     async with httpx.AsyncClient(
         timeout=settings.request_timeout,
@@ -487,6 +701,11 @@ async def login_one_account(
                         str(_dig(body, ["authentication", "bid"]) or ""))
             return "", ""
 
+        # crAPI login — JSON API at /identity/api/auth/login
+        crapi_token, crapi_uid = await _crapi_login(client, target_url, email, password)
+        if crapi_token:
+            return crapi_token, crapi_uid
+
         # Generic fallback
         token, uid, _ = await _find_and_login(
             client, target_url,
@@ -494,6 +713,32 @@ async def login_one_account(
             email, password
         )
         return token, uid
+
+
+async def _crapi_login(
+    client: httpx.AsyncClient,
+    target_url: str,
+    email: str,
+    password: str,
+) -> tuple[str, str]:
+    """
+    Log into crAPI and return (token, user_id).
+    crAPI login: POST /identity/api/auth/login {email, password}
+    Returns {"token": "eyJ..."}
+    """
+    login_url = target_url + "/identity/api/auth/login"
+    try:
+        r = await client.post(login_url, json={"email": email, "password": password})
+        if r.status_code == 200:
+            body  = r.json()
+            token = body.get("token", "")
+            if token:
+                print(f"AUTO-ACCOUNTS: crAPI login success for {email}")
+                return token, ""
+        print(f"AUTO-ACCOUNTS: crAPI login returned HTTP {r.status_code}")
+    except Exception as e:
+        print(f"AUTO-ACCOUNTS: crAPI login error: {e}")
+    return "", ""
 
 
 def _needs_help(error: str, help_message: str) -> dict:

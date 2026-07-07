@@ -29,6 +29,13 @@ app = FastAPI(
     description="AI-Driven Autonomous Web Penetration Testing Agent"
 )
 
+# Startup banner — confirms the patched build is the one actually running.
+# If you don't see this line in the uvicorn console, you're on stale code.
+print("=" * 62)
+print("PentraAI build: FP-guards(bfla+idor+race) | module-dedup | "
+      "account-cache+retry  [loaded]")
+print("=" * 62)
+
 # ── CORS — allow React frontend to call this API ──────────────────
 app.add_middleware(
     CORSMiddleware,
@@ -46,13 +53,17 @@ _scans: dict[str, dict] = {}
 
 class ScanRequest(BaseModel):
     target_url: str                   # Target URL to scan
-    # Credentials are optional — agent creates accounts automatically
-    # Only provide these if auto account creation fails
+    # Credentials — agent creates accounts automatically if not provided
     user_a_email: str = ""
     user_a_password: str = ""
     user_b_email: str = ""
     user_b_password: str = ""
-    modules: list[str] = ["idor", "broken_auth", "business_logic"]
+    # Pre-authenticated tokens — provide these to skip auto-registration
+    # Get from browser DevTools → Network tab → Authorization header
+    # Required for apps with email verification (e.g. crAPI)
+    user_a_token: str = ""
+    user_b_token: str = ""
+    modules: list[str] = ["idor", "broken_auth", "race_condition"]
 
 class ScanResponse(BaseModel):
     scan_id: str
@@ -139,6 +150,74 @@ async def get_scan(scan_id: str):
     return _scans[scan_id]
 
 
+@app.get("/scan/{scan_id}/report")
+async def get_report(scan_id: str):
+    """
+    Generate and return a clean HTML report for the scan.
+    Open this URL in a browser to see a readable, structured report
+    with plain-English explanations, payloads, requests, and fixes.
+    """
+    if scan_id not in _scans:
+        raise HTTPException(status_code=404, detail="Scan not found")
+
+    scan = _scans[scan_id]
+    report = scan.get("results", {})
+
+    # If report not generated yet (scan still running), build a basic one
+    if not report:
+        report = {
+            "target":            scan.get("target_url", "unknown"),
+            "tech_stack":        {},
+            "total_findings":    0,
+            "critical": 0, "high": 0, "medium": 0, "low": 0,
+            "executive_summary": "Scan is still running or produced no report.",
+            "findings":          [],
+        }
+
+    from agents.html_report import generate_html_report
+    html_content = generate_html_report(report)
+
+    from fastapi.responses import HTMLResponse
+    return HTMLResponse(content=html_content)
+
+@app.get("/scan/{scan_id}/report.pdf")
+async def get_report_pdf(scan_id: str):
+    """Render the HTML report to a real PDF and return it as a download."""
+    if scan_id not in _scans:
+        raise HTTPException(status_code=404, detail="Scan not found")
+
+    scan = _scans[scan_id]
+    report = scan.get("results", {})
+    if not report:
+        report = {
+            "target": scan.get("target_url", "unknown"),
+            "findings": [],
+            "executive_summary": "Scan is still running or produced no report.",
+        }
+
+    from agents.html_report import generate_html_report
+    html_content = generate_html_report(report)
+
+    from playwright.async_api import async_playwright
+    async with async_playwright() as p:
+        browser = await p.chromium.launch()
+        page = await browser.new_page()
+        await page.set_content(html_content, wait_until="load")
+        pdf_bytes = await page.pdf(
+            format="A4",
+            print_background=True,
+            margin={"top": "12mm", "bottom": "12mm", "left": "10mm", "right": "10mm"},
+        )
+        await browser.close()
+
+    from fastapi import Response
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={"Content-Disposition": 'attachment; filename="pentraai_report.pdf"'},
+    )
+
+
 # ── Internal helpers ──────────────────────────────────────────────
 
 def _emit(scan_id: str, event_type: str, data: dict):
@@ -185,6 +264,11 @@ async def _run_scan_pipeline(scan_id: str, request: ScanRequest):
     Emits events at each step so the frontend stays updated.
     """
     try:
+        # Fresh accounts per scan: clear any accounts cached from a previous scan
+        # so state-dependent tests (e.g. race conditions) stay reproducible.
+        from modules.auto_accounts import reset_account_cache
+        reset_account_cache()
+
         # ── Phase 1: Recon ────────────────────────────────────────
         _emit(scan_id, "progress", {
             "phase":   "recon",
@@ -228,6 +312,21 @@ async def _run_scan_pipeline(scan_id: str, request: ScanRequest):
                     "endpoints":  [request.target_url],
                     "confidence": "MEDIUM"
                 })
+
+        # Collapse aliased modules so the same underlying detector never runs
+        # twice. 'business_logic' is an alias of 'race_condition' (both dispatch
+        # to run_race_condition); running both produced duplicate race findings
+        # on different baskets. Keep the first occurrence of each real detector.
+        _MODULE_ALIASES = {"business_logic": "race_condition"}
+        _seen_detectors: set = set()
+        _unique_plan = []
+        for _item in test_plan:
+            _canon = _MODULE_ALIASES.get(_item["module"].lower(), _item["module"].lower())
+            if _canon in _seen_detectors:
+                continue
+            _seen_detectors.add(_canon)
+            _unique_plan.append(_item)
+        test_plan = _unique_plan
 
         _emit(scan_id, "progress", {
             "phase":   "hypothesis",
@@ -296,24 +395,40 @@ async def _run_module(
 ) -> list[dict]:
     """Route to the correct vulnerability module."""
 
+    # If tokens were provided directly, inject into recon_data
+    # so modules can use them without auto-registration
+    if request.user_a_token:
+        recon_data["provided_token_a"] = request.user_a_token
+        recon_data["provided_token_b"] = request.user_b_token
+        recon_data["provided_email_a"] = request.user_a_email
+        recon_data["provided_email_b"] = request.user_b_email
+
+    # If credentials were provided (no tokens), inject them so modules
+    # login fresh each scan — avoids token expiry on crAPI/real targets
+    if request.user_a_email and request.user_a_password and not request.user_a_token:
+        recon_data["cred_email_a"] = request.user_a_email
+        recon_data["cred_pass_a"]  = request.user_a_password
+        recon_data["cred_email_b"] = request.user_b_email
+        recon_data["cred_pass_b"]  = request.user_b_password
+
     if module_name == "idor":
-            from modules.idor import run_idor
-            return await run_idor(
-                recon_data       = recon_data,
-                target_url       = request.target_url,
-                user_a_email     = request.user_a_email,
-                user_a_password  = request.user_a_password,
-                user_b_email     = request.user_b_email,
-                user_b_password  = request.user_b_password,
-            )
+        from modules.idor import run_idor
+        return await run_idor(
+            recon_data      = recon_data,
+            target_url      = request.target_url,
+            user_a_email    = request.user_a_email,
+            user_a_password = request.user_a_password,
+            user_b_email    = request.user_b_email,
+            user_b_password = request.user_b_password,
+        )
 
     elif module_name == "broken_auth":
         from modules.broken_auth import run_broken_auth
         return await run_broken_auth(
-            recon_data=recon_data,
-            user_email=request.user_a_email,
-            user_password=request.user_a_password,
-            target_url=request.target_url,
+            recon_data    = recon_data,
+            user_email    = request.user_a_email,
+            user_password = request.user_a_password,
+            target_url    = request.target_url,
         )
 
     elif module_name in ["business_logic", "race_condition"]:
@@ -324,5 +439,29 @@ async def _run_module(
             user_email    = request.user_a_email,
             user_password = request.user_a_password,
         )
+    
+    elif module_name == "ssrf":
+        from modules.ssrf import run_ssrf
+        return await run_ssrf(
+            recon_data      = recon_data,
+            target_url      = request.target_url,
+            user_a_email    = request.user_a_email,
+            user_a_password = request.user_a_password,
+            user_b_email    = request.user_b_email,
+            user_b_password = request.user_b_password,
+        )
+    elif module_name == "bfla":
+        from modules.bfla import run_bfla
+        return await run_bfla(
+            recon_data      = recon_data,
+            target_url      = request.target_url,
+            user_a_email    = request.user_a_email,
+            user_a_password = request.user_a_password,
+            user_b_email    = request.user_b_email,
+            user_b_password = request.user_b_password,
+        )
+    
+
+
 
     return []

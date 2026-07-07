@@ -20,9 +20,17 @@ Strategy: PROBE THEN RACE
    Step 2: Race that proven-working endpoint with 30 simultaneous requests
    Step 3: Count successes vs expected max
    Step 4: LLM determines the finding type and severity
-   
+
    This avoids wasting race attempts on endpoints that don't work,
    and ensures we only report real findings.
+
+FALSE-POSITIVE HARDENING (conservative — can only remove weak findings):
+   * A finding is only reported when the endpoint represents a CONSTRAINED resource
+     (coupon, order, checkout, wallet, credit, transfer, otp, ...). "Many submissions
+     accepted" on an unconstrained endpoint (feedback, comments) is NOT a vulnerability
+     and is reported as info only in the logs, not as a finding.
+   * A TRUE race_condition requires an actual overrun (successes > expected maximum),
+     so a single legitimate success can never be mislabelled as a race.
 """
 
 import json
@@ -30,10 +38,34 @@ import asyncio
 import httpx
 from llm import call_llm
 from config import settings
+from knowledge import knowledge_section
 from modules.auto_accounts import create_two_accounts, login_one_account
+
+# Race-condition reference methodology (from skill_knowledge/race_condition.md),
+# injected into the LLM verdict prompt as a modest slice.
+_RACE_KB = knowledge_section("race_condition", max_chars=1500)
 
 RACE_COUNT = 30
 RACE_TIMEOUT = 45
+
+
+# ── Constrained-resource gate (false-positive reduction) ──────────
+# Only endpoints whose purpose implies a limit should be flagged. Accepting many
+# concurrent requests is only a vulnerability when something SHOULD have stopped
+# them (one coupon, one checkout of a fixed balance, one OTP, ...).
+_CONSTRAINED_KEYWORDS = {
+    "coupon", "voucher", "promo", "discount", "redeem", "reward", "referral",
+    "checkout", "order", "orders", "place_order", "purchase", "payment", "pay",
+    "transfer", "wallet", "credit", "balance", "topup", "top-up", "withdraw",
+    "cashout", "otp", "claim", "gift", "bonus", "points", "stock", "inventory",
+    "reserve", "booking",
+}
+
+
+def _is_constrained_resource(candidate: dict) -> bool:
+    """True if the endpoint represents a resource that should be limited."""
+    text = f"{candidate.get('url', '')} {candidate.get('name', '')}".lower()
+    return any(keyword in text for keyword in _CONSTRAINED_KEYWORDS)
 
 
 async def run_race_condition(
@@ -237,6 +269,42 @@ async def _build_candidates(
         # ── Generic target candidates ─────────────────────────────
         alive = recon_data.get("alive_endpoints", [])
 
+        # Detect crAPI by its signature endpoints and add known race targets
+        is_crapi = any("/workshop/api/" in e or "/identity/api/" in e
+                       or "/community/api/" in e for e in alive)
+
+        if is_crapi:
+            print("RACE: Detected crAPI — adding known race condition targets")
+            # crAPI's coupon endpoint with its known valid coupon code
+            candidates.append({
+                "name":             "crAPI coupon validation race",
+                "url":              f"{base}/community/api/v2/coupon/validate-coupon",
+                "method":           "POST",
+                "body":             {"coupon_code": "TRAC075", "amount": 75},
+                "expected_success": 1,
+                "finding_hint":     "race_condition",
+                "reset_fn":         None,
+            })
+            candidates.append({
+                "name":             "crAPI apply coupon race",
+                "url":              f"{base}/workshop/api/shop/apply_coupon",
+                "method":           "POST",
+                "body":             {"coupon_code": "TRAC075", "amount": 75},
+                "expected_success": 1,
+                "finding_hint":     "race_condition",
+                "reset_fn":         None,
+            })
+            # crAPI order placement
+            candidates.append({
+                "name":             "crAPI order placement race",
+                "url":              f"{base}/workshop/api/shop/orders",
+                "method":           "POST",
+                "body":             {"product_id": 1, "quantity": 1},
+                "expected_success": 1,
+                "finding_hint":     "race_condition",
+                "reset_fn":         None,
+            })
+
         # Pattern-based detection
         pattern_candidates = _pattern_candidates(alive, base)
 
@@ -245,12 +313,13 @@ async def _build_candidates(
 
         # Merge and deduplicate
         seen = set()
-        for c in pattern_candidates + llm_candidates:
+        for c in candidates + pattern_candidates + llm_candidates:
             if c["url"] not in seen:
                 seen.add(c["url"])
-                candidates.append(c)
+                if c not in candidates:
+                    candidates.append(c)
 
-    return candidates[:6]
+    return candidates[:8]
 
 
 async def _find_working_juiceshop_coupon(
@@ -356,19 +425,28 @@ async def _get_captcha(
 
 
 def _pattern_candidates(alive: list[str], base: str) -> list[dict]:
-    """Find race candidates by URL pattern matching."""
+    """
+    Find race condition candidates by URL pattern matching.
+    Works on ANY target — looks for action-type endpoints by keyword.
+    Covers crAPI-style microservice paths and standard REST APIs.
+    """
     candidates = []
     patterns = {
-        "coupon":   ("Coupon redemption race",  "POST", {"code": "TEST10"}),
-        "voucher":  ("Voucher redemption race",  "POST", {"code": "TEST123"}),
-        "promo":    ("Promo code race",          "POST", {"promo": "SAVE10"}),
-        "redeem":   ("Redemption race",          "POST", {"token": "TEST"}),
-        "referral": ("Referral bonus race",      "POST", {}),
-        "reward":   ("Reward claiming race",     "POST", {}),
-        "transfer": ("Transfer race",            "POST", {"amount": 1}),
-        "discount": ("Discount race",            "POST", {"code": "DISC10"}),
-        "otp":      ("OTP verification race",    "POST", {"otp": "123456"}),
-        "claim":    ("Claim race",               "POST", {}),
+        "coupon":        ("Coupon redemption race",   "POST", {"coupon_code": "TRAC075"}),
+        "apply_coupon":  ("Apply coupon race",        "POST", {"coupon_code": "TRAC075"}),
+        "voucher":       ("Voucher redemption race",  "POST", {"code": "TEST123"}),
+        "promo":         ("Promo code race",          "POST", {"promo": "SAVE10"}),
+        "redeem":        ("Redemption race",          "POST", {"token": "TEST"}),
+        "referral":      ("Referral bonus race",      "POST", {}),
+        "reward":        ("Reward claiming race",     "POST", {}),
+        "transfer":      ("Transfer race",            "POST", {"amount": 1}),
+        "discount":      ("Discount race",            "POST", {"code": "DISC10"}),
+        "otp":           ("OTP verification race",   "POST", {"otp": "123456"}),
+        "claim":         ("Claim race",               "POST", {}),
+        "checkout":      ("Checkout race",            "POST", {}),
+        "place_order":   ("Place order race",         "POST", {}),
+        "wallet":        ("Wallet credit race",       "POST", {"amount": 100}),
+        "credit":        ("Credit race",              "POST", {"amount": 100}),
     }
 
     for endpoint in alive:
@@ -379,7 +457,7 @@ def _pattern_candidates(alive: list[str], base: str) -> list[dict]:
                     base.rstrip("/") + "/" + endpoint.lstrip("/")
                 )
                 candidates.append({
-                    "name":             f"{name}",
+                    "name":             name,
                     "url":              url,
                     "method":           method,
                     "body":             body,
@@ -423,9 +501,11 @@ Return [] if nothing suitable found.
         if not isinstance(candidates, list):
             return []
 
-        # Validate/fix URLs
+        # Validate/fix URLs — skip any item that is not a dict
         valid = []
         for c in candidates:
+            if not isinstance(c, dict):
+                continue   # LLM sometimes returns strings — skip them
             url = c.get("url", "")
             if not url:
                 continue
@@ -434,6 +514,10 @@ Return [] if nothing suitable found.
                 c["url"] = url
             if "finding_hint" not in c:
                 c["finding_hint"] = "race_condition"
+            if "method" not in c:
+                c["method"] = "POST"
+            if "expected_success" not in c:
+                c["expected_success"] = 1
             valid.append(c)
         return valid
 
@@ -542,6 +626,10 @@ def _llm_evaluate(
 
     prompt = f"""You are a security analyst evaluating a race condition test result.
 
+=== Race condition / concurrency reference ===
+{_RACE_KB}
+=== end reference ===
+
 Endpoint tested: {candidate['url']}
 Method: {candidate.get('method', 'POST')}
 Test description: {candidate['name']}
@@ -596,6 +684,50 @@ Return ONLY JSON:
         return None
 
     finding_type = result.get("finding_type", hint)
+
+    # ── Deterministic false-positive guards (added) ───────────────────────────
+    # Guard A — control held: if any concurrent request was REJECTED with a
+    # message showing the protection triggered (insufficient balance, already
+    # used, duplicate, limit reached, out of stock, conflict...), then the
+    # resource control actually held and this is not a confirmed race win.
+    _PROTECTION_SIGNALS = (
+        "insufficient", "not enough", "already", "duplicate", "limit",
+        "exceeded", "denied", "forbidden", "out of stock", "sold out",
+        "conflict", "expired", "invalid coupon", "not allowed",
+    )
+    _failure_text = " ".join(str(x).lower() for x in race_result.get("sample_failure", []))
+    if race_result.get("failures", 0) > 0 and any(s in _failure_text for s in _PROTECTION_SIGNALS):
+        print(f"RACE:   (info) {race_result.get('failures')} request(s) rejected by the resource "
+              f"control ('{_failure_text[:60]}...') — control held, not a confirmed race")
+        return None
+
+    # Guard B — creation endpoint: creating many INDEPENDENT resources
+    # (new-coupon, signup, register, /new, create) is not a TOCTOU overrun of a
+    # single limited resource. Downgrade to informational rather than a race.
+    _url_l = candidate.get("url", "").lower()
+    _CREATE_MARKERS = ("new-", "/new", "create", "signup", "sign-up", "register",
+                       "checkout", "/order", "purchase", "place-order", "/buy")
+    if finding_type == "race_condition" and any(m in _url_l for m in _CREATE_MARKERS):
+        print(f"RACE:   (info) {successes}/{RACE_COUNT} succeeded on a creation endpoint "
+              f"'{candidate['name']}' — many independent creates is not a TOCTOU race; not reported")
+        return None
+    # ──────────────────────────────────────────────────────────────────────────
+
+    # ── Conservative false-positive gate (only removes weak findings) ──
+    # 1) Only report on resources that SHOULD be limited. Accepting many concurrent
+    #    requests on an unconstrained endpoint (feedback, comments, generic POST) is
+    #    normal behaviour, not a vulnerability.
+    if not _is_constrained_resource(candidate):
+        print(f"RACE:   (info) {successes}/{RACE_COUNT} succeeded on an unconstrained "
+              f"endpoint '{candidate['name']}' — not reported (no limit is expected here)")
+        return None
+
+    # 2) A TRUE race/TOCTOU requires an actual overrun beyond the allowed maximum.
+    #    A single legitimate success must never be labelled a race condition.
+    if finding_type == "race_condition" and successes <= expected:
+        print(f"RACE:   (info) {successes}/{RACE_COUNT} succeeded but no overrun beyond "
+              f"expected max {expected} — not a race condition")
+        return None
 
     # Build human-readable vulnerability name
     if finding_type == "race_condition":
